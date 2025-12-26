@@ -873,22 +873,6 @@ async def put_ai_context(new_ai_context: PutAIContext, _: bool = Depends(auth.re
         except Exception as e:
             HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
 
-@app.post("/api/auth/refresh-token")
-async def refresh_token_endpoint(request: Request):
-    """
-    Эндпоинт для обновления JWT токена
-    """
-    token = await auth.get_token_from_header(request)
-    if not token:
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
-    
-    result = await auth.refresh_token(token)
-    if result is None:
-        raise HTTPException(status_code=401, detail="Failed to refresh token")
-    
-    return result
-
-
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     # Проверяем, является ли пользователь админом

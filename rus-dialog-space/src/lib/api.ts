@@ -3,44 +3,7 @@ import { config } from '@/config';
 
 export const API_URL = config.apiUrl;
 
-// Функция для обновления токена
-const refreshAccessToken = async (): Promise<boolean> => {
-  try {
-    const refreshToken = localStorage.getItem('refresh_token');
-    if (!refreshToken) {
-      console.log('❌ Refresh token не найден в localStorage');
-      return false;
-    }
-
-    console.log('🔄 Обновление access token...');
-    
-    const response = await fetch(`${API_URL}/auth/refresh-token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${refreshToken}`,
-      },
-    });
-
-    if (!response.ok) {
-      console.error('❌ Ошибка обновления токена:', response.status, response.statusText);
-      return false;
-    }
-
-    const data = await response.json();
-    console.log('✅ Токен успешно обновлен');
-    
-    // Сохраняем новый access token
-    localStorage.setItem('access_token', data.access_token);
-    
-    return true;
-  } catch (error) {
-    console.error('❌ Ошибка при обновлении токена:', error);
-    return false;
-  }
-};
-
-// Функция для выполнения запроса с автоматическим обновлением токена
+// Функция для выполнения запроса с токеном
 export const fetchWithTokenRefresh = async (
   url: string, 
   options: RequestInit = {}
@@ -68,33 +31,18 @@ export const fetchWithTokenRefresh = async (
     headers,
   };
 
-  // Выполняем первый запрос
-  let response = await fetch(url, requestOptions);
+  // Выполняем запрос
+  const response = await fetch(url, requestOptions);
 
-  // Если получили 401, пробуем обновить токен и повторить запрос
+  // Если получили 401, токен истек - просим пользователя авторизоваться заново
   if (response.status === 401) {
-    console.log('🔄 Получен 401, пробуем обновить токен...');
+    console.log('❌ Получен 401, токен истек или недействителен');
     
-    const tokenRefreshed = await refreshAccessToken();
+    // Удаляем токен из localStorage
+    localStorage.removeItem('access_token');
     
-    if (tokenRefreshed) {
-      // Повторяем запрос с новым токеном
-      const newAccessToken = localStorage.getItem('access_token');
-      if (newAccessToken) {
-        headers['Authorization'] = `Bearer ${newAccessToken}`;
-        const retryOptions = {
-          ...options,
-          headers,
-        };
-        
-        console.log('🔄 Повторяем запрос с новым токеном...');
-        response = await fetch(url, retryOptions);
-      }
-    } else {
-      console.log('❌ Не удалось обновить токен, перенаправляем на логин');
-      // Можно добавить логику перенаправления на страницу логина
-      // window.location.href = '/login';
-    }
+    // Показываем сообщение пользователю
+    toast.error('Сессия истекла. Пожалуйста, авторизуйтесь заново.');
   }
 
   return response;

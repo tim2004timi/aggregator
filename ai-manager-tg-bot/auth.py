@@ -4,49 +4,18 @@ from fastapi import HTTPException, Depends, Request
 from typing import Optional
 
 # Конфигурация сервиса аутентификации
-AUTH_SERVICE_BASE_URL = "http://46.173.25.54:8000"
-CHECK_PERMISSIONS_URL = f"{AUTH_SERVICE_BASE_URL}/api/jwt/check-permissions"
-REFRESH_TOKEN_URL = f"{AUTH_SERVICE_BASE_URL}/api/jwt/refresh/"
+AUTH_SERVICE_BASE_URL = "http://109.172.36.219:8000"
+CHECK_PERMISSIONS_URL = f"{AUTH_SERVICE_BASE_URL}/api/auth/me"
 
-async def check_permissions(token: str, permission: str = "message") -> bool:
+async def check_permissions(token: str) -> bool:
     """
     Проверяет разрешения пользователя через сервис аутентификации
     
     Args:
         token: JWT токен
-        permission: Требуемое разрешение (по умолчанию "message")
     
     Returns:
-        bool: True если пользователь авторизован и имеет разрешение
-    """
-    headers = {
-        "accept": "*/*",
-        "Authorization": f"Bearer {token}"
-    }
-    
-    params = {"permission": permission}
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(CHECK_PERMISSIONS_URL, headers=headers, params=params) as response:
-                if response.status == 204:
-                    return True
-                else:
-                    logging.warning(f"Permission check failed: {response.status}")
-                    return False
-    except Exception as e:
-        logging.error(f"Error checking permissions: {e}")
-        return False
-
-async def refresh_token(token: str) -> Optional[dict]:
-    """
-    Обновляет JWT токен через сервис аутентификации
-    
-    Args:
-        token: Текущий JWT токен
-    
-    Returns:
-        dict: Ответ от сервера аутентификации или None в случае ошибки
+        bool: True если пользователь авторизован и является администратором (is_admin==True)
     """
     headers = {
         "accept": "application/json",
@@ -55,15 +24,17 @@ async def refresh_token(token: str) -> Optional[dict]:
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(REFRESH_TOKEN_URL, headers=headers, data="") as response:
+            async with session.get(CHECK_PERMISSIONS_URL, headers=headers) as response:
                 if response.status == 200:
-                    return await response.json()
+                    data = await response.json()
+                    # Возвращаем True если is_admin==True
+                    return data.get("is_admin", False)
                 else:
-                    logging.warning(f"Token refresh failed: {response.status}")
-                    return None
+                    logging.warning(f"Permission check failed: {response.status}")
+                    return False
     except Exception as e:
-        logging.error(f"Error refreshing token: {e}")
-        return None
+        logging.error(f"Error checking permissions: {e}")
+        return False
 
 async def get_token_from_header(request: Request) -> Optional[str]:
     """
