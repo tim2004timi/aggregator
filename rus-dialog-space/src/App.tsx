@@ -25,13 +25,49 @@ const App = () => {
   console.log('App component rendering');
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    // Проверяем оба варианта параметра для обратной совместимости
-    const accessToken = params.get("access_token") || params.get("access");
+    // Логируем полный URL для отладки
+    const fullUrl = window.location.href;
+    const searchString = window.location.search;
+    const hashString = window.location.hash;
+    
+    console.log('🔍 Полный URL:', fullUrl);
+    console.log('🔍 Search строка:', searchString);
+    console.log('🔍 Hash:', hashString);
+    
+    // Пробуем получить токен из query string
+    let accessToken: string | null = null;
+    
+    if (searchString) {
+      const params = new URLSearchParams(searchString);
+      
+      // Логируем все параметры для отладки
+      const allParams = Array.from(params.entries());
+      console.log('🔍 Все параметры из query string:', allParams);
+      
+      // Проверяем оба варианта параметра для обратной совместимости
+      accessToken = params.get("access_token") || params.get("access");
+    }
+    
+    // Если токен не найден в query string, пробуем извлечь из hash (на случай если он там)
+    if (!accessToken && hashString) {
+      const hashParams = new URLSearchParams(hashString.substring(1));
+      console.log('🔍 Параметры из hash:', Array.from(hashParams.entries()));
+      accessToken = hashParams.get("access_token") || hashParams.get("access");
+    }
+    
+    // Альтернативный способ: парсим URL напрямую через регулярное выражение
+    if (!accessToken) {
+      const match = fullUrl.match(/[?&]access_token=([^&?#]+)/);
+      if (match && match[1]) {
+        accessToken = decodeURIComponent(match[1]);
+        console.log('🔍 Токен найден через regex из полного URL');
+      }
+    }
 
     console.log('🔍 Проверка токена в URL:', {
       accessToken: accessToken ? `${accessToken.substring(0, 20)}...` : null,
-      hasAccessToken: !!accessToken
+      hasAccessToken: !!accessToken,
+      accessTokenLength: accessToken?.length
     });
 
     if (accessToken) {
@@ -48,6 +84,7 @@ const App = () => {
       });
 
       // Удалить токен из URL
+      const params = new URLSearchParams(window.location.search);
       params.delete("access_token");
       params.delete("access"); // Удаляем и старый параметр для обратной совместимости
       const newUrl =
