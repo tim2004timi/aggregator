@@ -24,15 +24,6 @@ export const fetchWithTokenRefresh = async (
   
   if (accessToken) {
     headers['Authorization'] = `Bearer ${accessToken}`;
-    console.log('🔑 Отправка запроса с токеном:', {
-      url,
-      hasToken: !!accessToken,
-      tokenLength: accessToken.length,
-      tokenPreview: `${accessToken.substring(0, 20)}...${accessToken.substring(accessToken.length - 10)}`,
-      authorizationHeader: headers['Authorization'] ? `${headers['Authorization'].substring(0, 30)}...` : null
-    });
-  } else {
-    console.log('⚠️ Токен не найден в localStorage для запроса:', url);
   }
 
   const requestOptions = {
@@ -45,8 +36,6 @@ export const fetchWithTokenRefresh = async (
 
   // Если получили 401, токен истек - просим пользователя авторизоваться заново
   if (response.status === 401) {
-    console.log('❌ Получен 401, токен истек или недействителен');
-    
     // Удаляем токен из localStorage
     localStorage.removeItem('access_token');
     
@@ -64,20 +53,10 @@ const getAuthHeaders = () => {
     'Content-Type': 'application/json',
   };
   
-  console.log('🔑 Формирование заголовков для API запроса:', {
-    hasAccessToken: !!accessToken,
-    accessTokenLength: accessToken?.length,
-    accessTokenPreview: accessToken ? `${accessToken.substring(0, 20)}...` : null
-  });
-  
   if (accessToken) {
     headers['Authorization'] = `Bearer ${accessToken}`;
-    console.log('✅ Authorization заголовок добавлен');
-  } else {
-    console.log('⚠️ Access token не найден в localStorage');
   }
   
-  console.log('📤 Финальные заголовки:', headers);
   return headers;
 };
 
