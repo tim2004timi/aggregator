@@ -24,6 +24,15 @@ export const fetchWithTokenRefresh = async (
   
   if (accessToken) {
     headers['Authorization'] = `Bearer ${accessToken}`;
+    console.log('🔑 Отправка запроса с токеном:', {
+      url,
+      hasToken: !!accessToken,
+      tokenLength: accessToken.length,
+      tokenPreview: `${accessToken.substring(0, 20)}...${accessToken.substring(accessToken.length - 10)}`,
+      authorizationHeader: headers['Authorization'] ? `${headers['Authorization'].substring(0, 30)}...` : null
+    });
+  } else {
+    console.log('⚠️ Токен не найден в localStorage для запроса:', url);
   }
 
   const requestOptions = {

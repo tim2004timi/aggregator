@@ -73,6 +73,33 @@ const App = () => {
     if (accessToken) {
       console.log('💾 Сохранение токена в localStorage...');
       
+      // Проверяем срок действия токена (JWT)
+      try {
+        const tokenParts = accessToken.split('.');
+        if (tokenParts.length === 3) {
+          const payload = JSON.parse(atob(tokenParts[1]));
+          const exp = payload.exp;
+          const now = Math.floor(Date.now() / 1000);
+          const isExpired = exp < now;
+          const expiresIn = exp - now;
+          
+          console.log('🔍 Информация о токене:', {
+            exp: exp,
+            now: now,
+            expiresIn: expiresIn,
+            expiresInMinutes: Math.floor(expiresIn / 60),
+            isExpired: isExpired,
+            expiresAt: new Date(exp * 1000).toLocaleString()
+          });
+          
+          if (isExpired) {
+            console.warn('⚠️ Токен уже истек!');
+          }
+        }
+      } catch (e) {
+        console.log('⚠️ Не удалось декодировать токен:', e);
+      }
+      
       localStorage.setItem("access_token", accessToken);
       
       // Проверяем, что токен действительно сохранился
@@ -80,7 +107,8 @@ const App = () => {
       
       console.log('✅ Токен сохранен в localStorage:', {
         accessTokenSaved: !!savedAccessToken,
-        accessTokenLength: savedAccessToken?.length
+        accessTokenLength: savedAccessToken?.length,
+        tokensMatch: savedAccessToken === accessToken
       });
 
       // Удалить токен из URL
