@@ -110,27 +110,11 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     }
   }, [chatId, fetchChatInfo]);
 
-  // Send waiting=false periodically when chat is open
   useEffect(() => {
-    let intervalId: NodeJS.Timeout | null = null;
-
     if (chatId) {
-      // Send immediately on chat open
       markChatAsReadFromContext(chatId);
-
-      // Set interval for subsequent calls
-      intervalId = setInterval(() => {
-        markChatAsReadFromContext(chatId);
-      }, 3000); // Send every 3 seconds
     }
-
-    // Cleanup function to clear interval
-    return () => {
-      if (intervalId !== null) {
-        clearInterval(intervalId);
-      }
-    };
-  }, [chatId, markChatAsReadFromContext]); // Re-run effect if chatId or markChatAsReadFromContext changes
+  }, [chatId, markChatAsReadFromContext]);
 
   // Check if user is near bottom of chat
   const checkScrollPosition = useCallback(() => {

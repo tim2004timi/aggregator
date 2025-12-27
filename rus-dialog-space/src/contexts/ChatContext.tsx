@@ -52,9 +52,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setLoading(true);
       const chatData = await getChats();
       setChats(prevChats => {
-        // Preserve selected chat state
+        const prevChatMap = new Map(prevChats.map(c => [c.id, c]));
+        
         return chatData.map(newChat => {
-          const prevChat = prevChats.find(c => c.id === newChat.id);
+          const prevChat = prevChatMap.get(newChat.id);
           return prevChat ? { ...newChat, ...prevChat } : newChat;
         });
       });
@@ -114,7 +115,13 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
 
           setMessages(prevMessages => [...prevMessages, newMessage]);
+          
+          if (wsMsgTyped.message_type === 'question') {
+            apiMarkChatAsRead(Number(wsMsgTyped.chatId)).catch(err => 
+              console.error('Failed to mark incoming message as read:', err)
+            );
           }
+        }
 
         setChats(prevChats => {
           const updatedChats = prevChats.map(chat =>

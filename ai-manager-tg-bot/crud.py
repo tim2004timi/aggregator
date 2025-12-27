@@ -134,7 +134,6 @@ async def get_stats(db: AsyncSession):
     return {"total": total, "pending": pending, "ai": ai_count}
 
 async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> List[Dict[str, Any]]:
-    """Get all chats with their last message"""
     last_msg_ids = (
         select(func.max(Message.id).label("last_id"))
         .group_by(Message.chat_id)
@@ -180,7 +179,6 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
     return chats_with_messages
 
 async def get_chat_messages(db: AsyncSession, chat_id: int, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
-    """Get all messages for a specific chat"""
     query = (
         select(Message)
         .where(Message.chat_id == chat_id)
@@ -213,13 +211,11 @@ async def add_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
         return {"message": "error"}
     
     try:
-        # Инициализируем tags как пустой список, если None
         if chat.tags is None:
             chat.tags = []
         
-        # Добавляем тег, если его еще нет
         if tag not in chat.tags:
-            chat.tags = chat.tags + [tag]  # Создаем новый список для ARRAY
+            chat.tags = chat.tags + [tag]
         
         await db.commit()
         await db.refresh(chat)
@@ -234,13 +230,11 @@ async def remove_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
         return {"message": "error"}
     
     try:
-        # Инициализируем tags как пустой список, если None
         if chat.tags is None:
             chat.tags = []
         
-        # Удаляем тег, если он есть
         if tag in chat.tags:
-            chat.tags = [t for t in chat.tags if t != tag]  # Создаем новый список без тега
+            chat.tags = [t for t in chat.tags if t != tag]
         
         await db.commit()
         await db.refresh(chat)
