@@ -62,7 +62,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Calculate unread count
       const unread = chatData.filter(chat => chat.waiting).length;
       setUnreadCount(unread);
-      console.log('Chats after refreshChats:', chatData);
     } catch (error) {
       console.error('Failed to fetch chats:', error);
     } finally {
@@ -97,25 +96,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     try {
       const data = typeof lastMessage === 'string' ? JSON.parse(lastMessage) : lastMessage;
-      console.log('WS received [lastMessage]:', data); // Log message received
 
       // Check if the incoming message is a new chat message
       if (data.type === 'message') {
         const wsMsgTyped = data as IncomingMessageWebSocket;
-        console.log('WS processing [message]:', wsMsgTyped); // Log processing new message
         
         const currentSelectedChat = selectedChatRef.current;
         
-        console.log('WS compare IDs:', { // Log ID comparison
-          selected: currentSelectedChat?.id,
-          incoming: wsMsgTyped.chatId,
-          match: currentSelectedChat && currentSelectedChat.id === Number(wsMsgTyped.chatId)
-        });
-
         // If the message belongs to the currently selected chat, add it to messages state
         if (currentSelectedChat && currentSelectedChat.id === Number(wsMsgTyped.chatId)) {
-          console.log('WS match! Adding message to state.'); // Log when IDs match
-
           const newMessage: Message = {
             id: wsMsgTyped.id,
             chat_id: Number(wsMsgTyped.chatId),

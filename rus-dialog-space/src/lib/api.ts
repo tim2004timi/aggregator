@@ -10,6 +10,14 @@ export const fetchWithTokenRefresh = async (
 ): Promise<Response> => {
   // Добавляем токен к запросу
   const accessToken = localStorage.getItem('access_token');
+  
+  if (!accessToken) {
+    return new Response(JSON.stringify({ detail: 'Authorization token missing' }), {
+      status: 401,
+      headers: { 'Content-Type': 'application/json' }
+    });
+  }
+
   const headers: Record<string, string> = {};
   
   // Не устанавливаем Content-Type для FormData, браузер сам установит правильный
@@ -89,20 +97,11 @@ export const getChats = async (): Promise<Chat[]> => {
   try {
     const response = await fetchWithTokenRefresh(`${API_URL}/chats`);
     
-    console.log('📡 GET /chats - Статус ответа:', response.status, response.statusText);
-    
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Ошибка GET /chats:', {
-        status: response.status,
-        statusText: response.statusText,
-        errorBody: errorText
-      });
-      throw new Error(`Failed to fetch chats: ${response.status} ${response.statusText}`);
+      return [];
     }
     
     const chats = await response.json();
-    console.log('✅ GET /chats - Успешно получено чатов:', chats.length);
     
     return chats.map((chat: any) => ({
           id: chat.id,
@@ -255,20 +254,11 @@ export const getChatStats = async (): Promise<{ total: number, pending: number, 
   try {
     const response = await fetchWithTokenRefresh(`${API_URL}/stats`);
     
-    console.log('📡 GET /stats - Статус ответа:', response.status, response.statusText);
-    
     if (!response.ok) {
-      const errorText = await response.text();
-      console.error('❌ Ошибка GET /stats:', {
-        status: response.status,
-        statusText: response.statusText,
-        errorBody: errorText
-      });
-      throw new Error(`Failed to fetch stats: ${response.status} ${response.statusText}`);
+      return { total: 0, pending: 0, ai: 0 };
     }
     
     const stats = await response.json();
-    console.log('✅ GET /stats - Успешно получена статистика:', stats);
     
     return stats;
   } catch (error) {
