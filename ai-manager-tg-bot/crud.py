@@ -51,7 +51,7 @@ class Chat(Base):
 class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False, index=True)
     message = Column(String, nullable=False)
     message_type = Column(String, nullable=False)
     ai = Column(Boolean, default=False)
@@ -70,6 +70,8 @@ async def get_chat(db: AsyncSession, chat_id: int):
     return result.scalar_one_or_none()
 
 async def get_chat_by_uuid(db: AsyncSession, uuid: str):
+    if not uuid or not uuid.strip() or not uuid.replace('-', '').isalnum():
+        return None
     result = await db.execute(select(Chat).filter(Chat.uuid == uuid))
     return result.scalar_one_or_none()
 
@@ -133,25 +135,26 @@ async def get_stats(db: AsyncSession):
 
 async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> List[Dict[str, Any]]:
     """Get all chats with their last message"""
-    # First get all chats
-    query = select(Chat).order_by(desc(Chat.id))
+    last_msg_ids = (
+        select(func.max(Message.id).label("last_id"))
+        .group_by(Message.chat_id)
+        .subquery()
+    )
+    
+    query = (
+        select(Chat, Message)
+        .outerjoin(Message, Message.id == last_msg_ids.c.last_id)
+        .order_by(desc(Chat.id))
+    )
+    
     if limit:
         query = query.limit(limit)
+        
     result = await db.execute(query)
-    chats = result.scalars().all()
+    rows = result.all()
     
     chats_with_messages = []
-    for chat in chats:
-        # Get only the last message for each chat
-        last_message_query = (
-            select(Message)
-            .where(Message.chat_id == chat.id)
-            .order_by(desc(Message.id))
-            .limit(1)
-        )
-        last_message_result = await db.execute(last_message_query)
-        last_message = last_message_result.scalar_one_or_none()
-        
+    for chat, last_message in rows:
         chat_dict = {
             "id": chat.id,
             "uuid": chat.uuid,
@@ -176,21 +179,21 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
     
     return chats_with_messages
 
-async def get_chat_messages(db: AsyncSession, chat_id: int) -> List[Dict[str, Any]]:
+async def get_chat_messages(db: AsyncSession, chat_id: int, limit: int = 50, offset: int = 0) -> List[Dict[str, Any]]:
     """Get all messages for a specific chat"""
-    # Remove pagination: page and limit
     query = (
         select(Message)
         .where(Message.chat_id == chat_id)
-        .order_by(desc(Message.created_at)) # Keep ordering
-        # Removed: .limit(limit)
-        # Removed: .offset(offset)
+        .order_by(desc(Message.id)) 
+        .limit(limit)
+        .offset(offset)
     )
     
-    result = await db.execute(query);
-    messages = result.scalars().all();
+    result = await db.execute(query)
+    messages = result.scalars().all()
     
-    # Prepare messages in the format expected by the frontend
+    messages.reverse()
+    
     return [
         {
             "id": msg.id,

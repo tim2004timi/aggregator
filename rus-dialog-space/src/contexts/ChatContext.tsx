@@ -97,29 +97,25 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const data = typeof lastMessage === 'string' ? JSON.parse(lastMessage) : lastMessage;
 
-      // Check if the incoming message is a new chat message
       if (data.type === 'message') {
         const wsMsgTyped = data as IncomingMessageWebSocket;
         
         const currentSelectedChat = selectedChatRef.current;
         
-        // If the message belongs to the currently selected chat, add it to messages state
         if (currentSelectedChat && currentSelectedChat.id === Number(wsMsgTyped.chatId)) {
           const newMessage: Message = {
             id: wsMsgTyped.id,
             chat_id: Number(wsMsgTyped.chatId),
             created_at: wsMsgTyped.timestamp,
             message: wsMsgTyped.content,
-            message_type: wsMsgTyped.message_type === 'question' ? 'question' : 'answer', // Ensure valid type
+            message_type: wsMsgTyped.message_type === 'question' ? 'question' : 'answer',
             ai: wsMsgTyped.ai,
             is_image: wsMsgTyped.is_image || false,
           };
 
           setMessages(prevMessages => [...prevMessages, newMessage]);
-          console.log('WS messages state updated.'); // Log state update
           }
 
-        // Also update the last message preview in the chat list regardless of selected chat
         setChats(prevChats => {
           const updatedChats = prevChats.map(chat =>
             chat.id === Number(wsMsgTyped.chatId) ?
@@ -127,8 +123,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
               ...chat,
               lastMessage: wsMsgTyped.content,
               lastMessageTime: wsMsgTyped.timestamp,
-              // Optionally mark as unread if it's not the selected chat
-              // unread: currentSelectedChat?.id !== chat.id ? true : chat.unread
             } : chat
           );
           return updatedChats;
@@ -138,15 +132,13 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (error) {
       console.error('WS error processing lastMessage:', error);
     }
-  }, [lastMessage, selectedChatRef, setMessages, setChats]); // Added dependencies
+  }, [lastMessage, selectedChatRef, setMessages, setChats]);
 
-  // Handle WebSocket updates from lastUpdate stream
   useEffect(() => {
     if (!lastUpdate) return;
     
     try {
       const data = typeof lastUpdate === 'string' ? JSON.parse(lastUpdate) : lastUpdate;
-      console.log('WS received [lastUpdate]:', data); // Log update received
 
       if (data.type === 'chat_deleted' && data.chatId) {
         setChats(prevChats => prevChats.filter(chat => String(chat.id) !== String(data.chatId)));
@@ -160,50 +152,40 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         ));
         fetchStats();
       } else if (data.type === 'chat_created' && data.chat) {
-        // Handle new chat creation
         const newChat = data.chat;
-        console.log('WS processing [chat_created]:', newChat); // Log new chat data
 
         setChats(prevChats => [
-          newChat, // Add the new chat at the beginning
+          newChat,
           ...prevChats,
         ]);
 
-        // Update stats as a new chat was added
         fetchStats();
-      } else if (data.type === 'chat_update') { // Handling chat_update here
-        console.log('WS processing [chat_update]:', data); // Log chat_update processing
+      } else if (data.type === 'chat_update') {
         setChats(prevChats => prevChats.map(chat => 
           String(chat.id) === String(data.chat_id) 
             ? { 
                 ...chat, 
                 waiting: data.waiting,
-                ai: data.ai // Add ai status update
+                ai: data.ai
               } 
             : chat
         ));
-        // Обновляем статистику при изменении статуса чата
         fetchStats();
       } else if (data.type === 'chat_tags_updated' && data.chatId && data.tags) {
-        // Handle chat tags updated
-        console.log('WS processing [chat_tags_updated]:', data); // Log tag update data
-
         setChats(prevChats => {
           const updatedChats = prevChats.map(chat =>
             chat.id === data.chatId
               ? { ...chat, tags: data.tags }
               : chat
           );
-          // Ensure a new array reference is returned to trigger updates
           const newChatsArray = [...updatedChats];
-          console.log('WS chats list updated [chat_tags_updated]:', newChatsArray); // Log state update
           return newChatsArray;
            });
       }
     } catch (error) {
       console.error('WS error processing lastUpdate:', error);
     }
-  }, [lastUpdate, fetchStats, selectedChatRef, setChats, setSelectedChat]); // Depends on lastUpdate and fetchStats
+  }, [lastUpdate, fetchStats, selectedChatRef, setChats, setSelectedChat]);
 
   // Начальная загрузка статистики
   useEffect(() => {

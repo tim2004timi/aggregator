@@ -26,13 +26,14 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {
-    const socket = new WebSocket(`${config.wsUrl}/messages`);
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+
+    const socket = new WebSocket(`${config.wsUrl}/messages?token=${token}`);
     socket.onopen = () => {
-      console.log('WebSocket connected');
       setIsConnected(true);
     };
     socket.onclose = () => {
-      console.log('WebSocket disconnected');
       setIsConnected(false);
       // Attempt to reconnect after 5 seconds
       setTimeout(() => {
@@ -42,7 +43,6 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
-        console.log('Received WebSocket message:', message);
         setLastMessage(message);
       } catch (error) {
         console.error('Error parsing WebSocket message:', error);
@@ -56,16 +56,17 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   }, []);
 
   useEffect(() => {
-    const socket = new WebSocket(`${config.wsUrl}/updates`);
+    const token = localStorage.getItem('access_token');
+    if (!token) return;
+
+    const socket = new WebSocket(`${config.wsUrl}/updates?token=${token}`);
     socket.onopen = () => {};
     socket.onclose = () => {
-      console.log('Updates WebSocket disconnected');
       setTimeout(() => setUpdatesWs(null), 5000);
     };
     socket.onmessage = (event) => {
       try {
         const update = JSON.parse(event.data);
-        console.log('Received Updates WebSocket message:', update);
         setLastUpdate(update);
       } catch (error) {
         console.error('Error parsing Updates WebSocket message:', error);

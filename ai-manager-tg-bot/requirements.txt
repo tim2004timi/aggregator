@@ -1,9 +1,9 @@
-python-dotenv==1.0.0
+python-dotenv==1.0.1
 sqlalchemy==2.0.23
 asyncpg==0.29.0
-fastapi==0.104.1
-uvicorn==0.24.0
-aiohttp==3.9.1
+fastapi==0.115.0
+uvicorn==0.30.0
+aiohttp==3.10.0
 websockets==12.0
 python-telegram-bot==20.7
 aiogram
@@ -11,3 +11,4 @@ requests
 minio
 python-multipart
 vk_api
+slowapi

@@ -11,10 +11,13 @@ from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
 from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag, sync_vk
 import requests
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 from shared import get_bot
 import json
 from contextlib import asynccontextmanager
@@ -76,92 +79,164 @@ async def handle_events():
     while True:
         event = await queue.get()
         logging.debug("⚪ Взял из очереди событие: %s", event)
+        asyncio.create_task(handle_single_event(event))
 
-        if event.type != VkBotEventType.MESSAGE_NEW:
-            continue
+async def handle_single_event(event):
+    if event.type != VkBotEventType.MESSAGE_NEW:
+        return
 
-        msg = event.object['message']
-        peer_id = msg['peer_id']
-        user_id = msg['from_id']
-        text = msg.get('text', "")
-        attachments = msg.get("attachments", [])
+    msg = event.object['message']
+    peer_id = msg['peer_id']
+    user_id = msg['from_id']
+    text = msg.get('text', "")
+    attachments = msg.get("attachments", [])
 
-        # Получаем информацию о пользователе
-        try:
-            user_info = await asyncio.to_thread(
-                vk.users.get,
-                user_ids=[user_id],
-                fields=['first_name', 'last_name']
-            )
-            if user_info:
-                user = user_info[0]
-                user_name = f"{user['first_name']} {user['last_name']}"
-            else:
-                user_name = str(user_id)
-        except Exception as e:
-            logging.error(f"Error getting VK user info: {e}")
+    # Получаем информацию о пользователе
+    try:
+        user_info = await asyncio.to_thread(
+            vk.users.get,
+            user_ids=[user_id],
+            fields=['first_name', 'last_name']
+        )
+        if user_info:
+            user = user_info[0]
+            user_name = f"{user['first_name']} {user['last_name']}"
+        else:
             user_name = str(user_id)
+    except Exception as e:
+        logging.error(f"Error getting VK user info: {e}")
+        user_name = str(user_id)
 
-        # --- 1) Работа с чатом в БД, WebSocket-апдейты ---
-        async with async_session() as session:
-            # Получаем или создаём чат
-            chat = await get_chat_by_uuid(session, str(peer_id))
-            if not chat:
-                chat = await create_chat(
-                    session,
-                    str(peer_id),
-                    name=user_name,
-                    messager="vk"
-                )
-                new_chat_message = {
-                    "type": "chat_created",
-                    "chat": {
-                        "id": chat.id,
-                        "uuid": chat.uuid,
-                        "name": chat.name,
-                        "messager": chat.messager,
-                        "waiting": chat.waiting,
-                        "ai": chat.ai,
-                        "tags": chat.tags,
-                        "last_message_content": None,
-                        "last_message_timestamp": None
+    # --- 1) Работа с чатом в БД, WebSocket-апдейты ---
+    async with async_session() as session:
+        # Получаем или создаём чат
+        chat = await get_chat_by_uuid(session, str(peer_id))
+        if not chat:
+            chat = await create_chat(
+                session,
+                str(peer_id),
+                name=user_name,
+                messager="vk"
+            )
+            new_chat_message = {
+                "type": "chat_created",
+                "chat": {
+                    "id": chat.id,
+                    "uuid": chat.uuid,
+                    "name": chat.name,
+                    "messager": chat.messager,
+                    "waiting": chat.waiting,
+                    "ai": chat.ai,
+                    "tags": chat.tags,
+                    "last_message_content": None,
+                    "last_message_timestamp": None
+                }
+            }
+            await updates_manager.broadcast(json.dumps(new_chat_message))
+
+        # --- 2) Текстовое сообщение ---
+        if text:
+            # Создаём запись вопроса
+            db_msg = crud.Message(
+                chat_id=chat.id,
+                message=text,
+                message_type="question",
+                ai=False,
+                created_at=datetime.utcnow()
+            )
+            session.add(db_msg)
+            await session.commit()
+            await session.refresh(db_msg)
+
+            # Шлём фронту через WS
+            message_for_frontend = {
+                "type": "message",
+                "chatId": str(db_msg.chat_id),
+                "content": db_msg.message,
+                "message_type": db_msg.message_type,
+                "ai": db_msg.ai,
+                "timestamp": db_msg.created_at.isoformat(),
+                "id": db_msg.id
+            }
+            await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+            # Если AI выключен — обновляем waiting и выходим
+            if not chat.ai:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": True
+                }))
+                
+                # Отправляем уведомление админам
+                notification_manager = notifications.get_notification_manager()
+                if notification_manager:
+                    await notification_manager.send_waiting_notification(
+                        chat_id=peer_id,
+                        chat_name=user_name,
+                        messager="vk"
+                    )
+            else:
+                # --- 3) Отправляем вопрос AI-сервису и ждём ответ ---
+                current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+                try:
+                    async with current_session.post(
+                        API_URL,
+                        json={"question": text, "chat_id": chat.id}
+                    ) as resp:
+                        data = await resp.json()
+                except Exception as e:
+                    logging.error(f"AI request error: {e}")
+                    if current_session != http_session: await current_session.close()
+                    return
+                
+                if current_session != http_session: await current_session.close()
+
+                # Если пришёл ответ
+                if data.get("answer"):
+                    answer = data["answer"]
+                    # Отправляем ответ обратно в VK
+                    await asyncio.to_thread(
+                        vk.messages.send,
+                        peer_id=peer_id,
+                        message=answer,
+                        random_id=0
+                    )
+
+                    # Сохраняем ответ в БД
+                    db_ans = crud.Message(
+                        chat_id=chat.id,
+                        message=answer,
+                        message_type="answer",
+                        ai=True,
+                        created_at=datetime.utcnow()
+                    )
+                    session.add(db_ans)
+                    await session.commit()
+                    await session.refresh(db_ans)
+
+                    # Шлём на фронт через WS
+                    ans_for_frontend = {
+                        "type": "message",
+                        "chatId": str(db_ans.chat_id),
+                        "content": db_ans.message,
+                        "message_type": db_ans.message_type,
+                        "ai": db_ans.ai,
+                        "timestamp": db_ans.created_at.isoformat(),
+                        "id": db_ans.id
                     }
-                }
-                await updates_manager.broadcast(json.dumps(new_chat_message))
+                    await messages_manager.broadcast(json.dumps(ans_for_frontend))
 
-            # --- 2) Текстовое сообщение ---
-            if text:
-                # Создаём запись вопроса
-                db_msg = Message(
-                    chat_id=chat.id,
-                    message=text,
-                    message_type="question",
-                    ai=False,
-                    created_at=datetime.utcnow()
-                )
-                session.add(db_msg)
-                await session.commit()
-                await session.refresh(db_msg)
-
-                # Шлём фронту через WS
-                message_for_frontend = {
-                    "type": "message",
-                    "chatId": str(db_msg.chat_id),
-                    "content": db_msg.message,
-                    "message_type": db_msg.message_type,
-                    "ai": db_msg.ai,
-                    "timestamp": db_msg.created_at.isoformat(),
-                    "id": db_msg.id
-                }
-                await messages_manager.broadcast(json.dumps(message_for_frontend))
-
-                # Если AI выключен — обновляем waiting и выходим
-                if not chat.ai:
+                # Если AI сказал передать человеку
+                if data.get("manager") == "true":
                     await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                    await update_chat_ai(db=session, chat_id=chat.id, ai=False)
                     await updates_manager.broadcast(json.dumps({
                         "type": "chat_update",
                         "chat_id": chat.id,
-                        "waiting": True
+                        "waiting": True,
+                        "ai": False
                     }))
                     
                     # Отправляем уведомление админам
@@ -172,70 +247,6 @@ async def handle_events():
                             chat_name=user_name,
                             messager="vk"
                         )
-                else:
-                    # --- 3) Отправляем вопрос AI-сервису и ждём ответ ---
-                    async with aiohttp.ClientSession() as http_sess:
-                        try:
-                            resp = await http_sess.post(
-                                API_URL,
-                                json={"question": text, "chat_id": chat.id}
-                            )
-                            data = await resp.json()
-                        except Exception as e:
-                            logging.error(f"AI request error: {e}")
-                            continue
-
-                    # Если пришёл ответ
-                    if data.get("answer"):
-                        answer = data["answer"]
-                        # Отправляем ответ обратно в VK
-                        await asyncio.to_thread(
-                            vk.messages.send,
-                            peer_id=peer_id,
-                            message=answer,
-                            random_id=0
-                        )
-                        # Сохраняем ответ в БД
-                        db_ans = Message(
-                            chat_id=chat.id,
-                            message=answer,
-                            message_type="answer",
-                            ai=True,
-                            created_at=datetime.utcnow()
-                        )
-                        session.add(db_ans)
-                        await session.commit()
-                        await session.refresh(db_ans)
-                        # Шлём фронту
-                        await messages_manager.broadcast(json.dumps({
-                            "type": "message",
-                            "chatId": str(db_ans.chat_id),
-                            "content": db_ans.message,
-                            "message_type": db_ans.message_type,
-                            "ai": db_ans.ai,
-                            "timestamp": db_ans.created_at.isoformat(),
-                            "id": db_ans.id
-                        }))
-
-                    # Если сервис переключил на менеджера
-                    if data.get("manager") == "true":
-                        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
-                        await update_chat_ai(db=session, chat_id=chat.id, ai=False)
-                        await updates_manager.broadcast(json.dumps({
-                            "type": "chat_update",
-                            "chat_id": chat.id,
-                            "waiting": True,
-                            "ai": False
-                        }))
-                        
-                        # Отправляем уведомление админам
-                        notification_manager = notifications.get_notification_manager()
-                        if notification_manager:
-                            await notification_manager.send_waiting_notification(
-                                chat_id=peer_id,
-                                chat_name=user_name,
-                                messager="vk"
-                            )
 
             # --- 4) Обработка фото-вложений ---
             for att in attachments:
@@ -275,16 +286,20 @@ async def handle_events():
                         'Accept-Language': 'en-US,en;q=0.9',
                         'Referer': 'https://vk.com/'
                     }
-                    async with aiohttp.ClientSession() as http_sess:
-                        resp = await http_sess.get(url, headers=headers)
-                        if resp.status != 200:
-                            logging.error(f"Failed to download VK photo: {resp.status}")
-                            continue
-                        content = await resp.read()
-                        if not content:
-                            logging.error("Empty photo content received")
-                            continue
-                        logging.info(f"Successfully downloaded VK photo, size: {len(content)} bytes")
+                    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+                    try:
+                        async with current_session.get(url, headers=headers) as resp:
+                            if resp.status != 200:
+                                logging.error(f"Failed to download VK photo: {resp.status}")
+                                continue
+                            content = await resp.read()
+                    finally:
+                        if current_session != http_session: await current_session.close()
+
+                    if not content:
+                        logging.error("Empty photo content received")
+                        continue
+                    logging.info(f"Successfully downloaded VK photo, size: {len(content)} bytes")
                 except Exception as e:
                     logging.error(f"VK photo download error: {e}")
                     continue
@@ -379,6 +394,8 @@ APP_HOST = os.getenv("APP_HOST", "localhost")
 MINIO_LOGIN = os.getenv("MINIO_LOGIN")
 MINIO_PWD = os.getenv("MINIO_PWD")
 
+http_session: Optional[aiohttp.ClientSession] = None
+
 BUCKET_NAME = "psih-photo"
 minio_client = Minio(
     endpoint=f"minio:9000",
@@ -394,8 +411,11 @@ async def init_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global http_session
     # Инициализируем БД
     await init_db()
+    
+    http_session = aiohttp.ClientSession()
     
     # Инициализируем менеджер уведомлений
     notifications.init_notification_manager(bot)
@@ -422,12 +442,20 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
+    if http_session:
+        await http_session.close()
+
 app = FastAPI(lifespan=lifespan)
 
-# Увеличиваем лимит размера файла до 10MB
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080").split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://46.173.25.54:8080", "http://localhost:8080"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -461,21 +489,33 @@ class ConnectionManager:
 messages_manager = ConnectionManager()
 updates_manager = ConnectionManager()
 
-# WebSocket endpoints
 @app.websocket("/ws/messages")
 async def messages_websocket(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008)
+        return
+    
+    try:
+        is_authorized = await auth.check_permissions(token)
+        if not is_authorized:
+            await websocket.close(code=1008)
+            return
+    except Exception as e:
+        logging.error(f"WS auth error: {e}")
+        await websocket.close(code=1011)
+        return
+
     await messages_manager.connect(websocket)
     try:
         while True:
             data = await websocket.receive_text()
             try:
                 message_data = json.loads(data)
-                # If message is from frontend (manager), send it to the bot
                 if "chatId" in message_data and "content" in message_data:
                     try:
                         chat_id = int(message_data["chatId"])
                         await bot.send_message(chat_id=chat_id, text=message_data["content"])
-                        # Create message in database
                         chat = await get_chat(async_session(), chat_id)
                         if chat:
                             await create_message(
@@ -485,7 +525,6 @@ async def messages_websocket(websocket: WebSocket):
                                 "text",
                                 False
                             )
-                            # Send update to all clients
                             update_message = {
                                 "type": "update",
                                 "chatId": str(chat_id),
@@ -497,7 +536,6 @@ async def messages_websocket(websocket: WebSocket):
                             await updates_manager.broadcast(json.dumps(update_message))
                     except (ValueError, TypeError) as e:
                         logging.error(f"Invalid chat_id format: {e}")
-                # If message is from bot, broadcast it to all frontend clients
                 else:
                     await messages_manager.broadcast(data)
             except json.JSONDecodeError as e:
@@ -507,13 +545,27 @@ async def messages_websocket(websocket: WebSocket):
 
 @app.websocket("/ws/updates")
 async def updates_websocket(websocket: WebSocket):
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008)
+        return
+    
+    try:
+        is_authorized = await auth.check_permissions(token)
+        if not is_authorized:
+            await websocket.close(code=1008)
+            return
+    except Exception as e:
+        logging.error(f"WS auth error: {e}")
+        await websocket.close(code=1011)
+        return
+
     await updates_manager.connect(websocket)
     try:
         while True:
             data = await websocket.receive_text()
             try:
                 update_data = json.loads(data)
-                # Broadcast the update to all connected clients
                 await updates_manager.broadcast(data)
             except json.JSONDecodeError as e:
                 logging.error(f"Error parsing update: {e}")
@@ -522,9 +574,9 @@ async def updates_websocket(websocket: WebSocket):
 
 # Endpoints
 @app.get("/api/chats")
+@limiter.limit("60/minute")
 async def read_chats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chats_data = await get_chats_with_last_messages(db)
-    print("Backend /api/chats response data:", chats_data)
     return chats_data
 
 @app.get("/api/chats/{chat_id}")
@@ -537,10 +589,13 @@ async def read_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = 
 @app.get("/api/chats/{chat_id}/messages")
 async def read_messages(
     chat_id: int,
+    page: int = 1,
+    limit: int = 50,
     db: AsyncSession = Depends(get_db),
     _: bool = Depends(auth.require_auth)
 ):
-    return await get_chat_messages(db, chat_id)
+    offset = (page - 1) * limit
+    return await get_chat_messages(db, chat_id, limit, offset)
 
 # Schemas
 class ChatCreate(BaseModel):
@@ -556,6 +611,14 @@ class MessageCreate(BaseModel):
     message: str
     message_type: str
     ai: bool = False
+
+    @validator('message')
+    def message_not_empty(cls, v):
+        if not v or not v.strip():
+            raise ValueError('Message cannot be empty')
+        if len(v) > 4000:
+            raise ValueError('Message too long')
+        return v
 
 @app.post("/api/messages")
 async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
@@ -593,7 +656,21 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
         logging.error(f"Error sending message to {chat.messager}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to send message to {chat.messager}")
 
-    # 4. Отправляем сообщение через WebSocket
+    if msg.message_type == "answer":
+        await update_chat_waiting(db, msg.chat_id, False)
+        stats = await get_stats(db)
+        await updates_manager.broadcast(json.dumps({
+            "type": "chat_update",
+            "chat_id": msg.chat_id,
+            "waiting": False
+        }))
+        await updates_manager.broadcast(json.dumps({
+            "type": "stats_update",
+            "total": stats["total"], 
+            "pending": stats["pending"], 
+            "ai": stats["ai"]
+        }))
+
     message_for_frontend = {
         "type": "message",
         "chatId": str(db_msg.chat_id),
@@ -646,6 +723,7 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
     return chat
 
 @app.get("/api/stats")
+@limiter.limit("60/minute")
 async def stats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     return await get_stats(db)
 
@@ -777,7 +855,7 @@ async def upload_image(
     await db.commit()
     await db.refresh(db_img)
 
-    # 6. Отправляем фотографию в соответствующий мессенджер
+        # 6. Отправляем фотографию в соответствующий мессенджер
     try:
         if chat.messager == "telegram":
             # Создаем временный файл для отправки в Telegram
@@ -798,14 +876,16 @@ async def upload_image(
             )
             upload_url = upload_url['upload_url']
 
-            # Отправляем фото на сервер VK
-            async with aiohttp.ClientSession() as http_sess:
+            current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+            try:
                 form = aiohttp.FormData()
                 form.add_field('photo', content, filename='photo.jpg')
-                async with http_sess.post(upload_url, data=form) as resp:
+                async with current_session.post(upload_url, data=form) as resp:
                     if resp.status != 200:
                         raise Exception(f"Failed to upload photo to VK: {resp.status}")
                     upload_result = await resp.json()
+            finally:
+                if current_session != http_session: await current_session.close()
 
             # Сохраняем фото на сервере VK
             photo_data = await asyncio.to_thread(
@@ -843,15 +923,15 @@ async def upload_image(
 
 @app.get("/api/ai/context")
 async def get_ai_context(_: bool = Depends(auth.require_auth)):
-    async with aiohttp.ClientSession() as http_session:
-        try:
-            async with http_session.get(
-                API_URL,
-            ) as response:
-                data = await response.json()
-                return data
-        except Exception as e:
-            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.get(API_URL) as response:
+            data = await response.json()
+            return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+    finally:
+        if current_session != http_session: await current_session.close()
 
 class PutAIContext(BaseModel):
     system_message: str
@@ -859,19 +939,21 @@ class PutAIContext(BaseModel):
 
 @app.put("/api/ai/context")
 async def put_ai_context(new_ai_context: PutAIContext, _: bool = Depends(auth.require_auth)):
-    async with aiohttp.ClientSession() as http_session:
-        try:
-            async with http_session.post(
-                API_URL,
-                json={
-                    "system_message": new_ai_context.system_message,
-                    "faqs": new_ai_context.faqs
-                }
-            ) as response:
-                data = await response.json()
-                return data
-        except Exception as e:
-            HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.post(
+            API_URL,
+            json={
+                "system_message": new_ai_context.system_message,
+                "faqs": new_ai_context.faqs
+            }
+        ) as response:
+            data = await response.json()
+            return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
+    finally:
+        if current_session != http_session: await current_session.close()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -1010,66 +1092,69 @@ async def handle_message(message: Message):
                 )
             return
         
-        async with aiohttp.ClientSession() as http_session:
-            try:
-                async with http_session.post(
-                    API_URL,
-                    json={
-                        "question": message.text,
-                        "chat_id": chat.id
+        current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+        try:
+            async with current_session.post(
+                API_URL,
+                json={
+                    "question": message.text,
+                    "chat_id": chat.id
+                }
+            ) as response:
+                if response.status != 200:
+                    await message.answer("Извините, произошла ошибка при обработке запроса")
+                data = await response.json()
+                if not data:
+                    await message.answer("Извините, произошла ошибка при обработке запроса")
+                if "answer" in data:
+                    answer = data["answer"]
+                    await message.answer(answer)
+                    # Create message in database
+                    new_answer = crud.Message(
+                        chat_id=chat.id,
+                        message=answer,
+                        message_type="answer",
+                        ai=True,
+                        created_at=datetime.utcnow()
+                    )
+                    session.add(new_answer)
+                    await session.commit()
+                    await session.refresh(new_answer)
+                    # Format message for frontend
+                    message_for_frontend = {
+                        "type": "message",
+                        "chatId": chat.id,
+                        "content": answer,
+                        "message_type": "answer",
+                        "ai": True,
+                        "timestamp": new_answer.created_at.isoformat(),
+                        "id": new_answer.id
                     }
-                ) as response:
-                    if response.status != 200:
-                        await message.answer("Извините, произошла ошибка при обработке запроса")
-                    data = await response.json()
-                    if not data:
-                        await message.answer("Извините, произошла ошибка при обработке запроса")
-                    if "answer" in data:
-                        answer = data["answer"]
-                        await message.answer(answer)
-                        # Create message in database
-                        new_answer = Message(
-                            chat_id=chat.id,
-                            message=answer,
-                            message_type="answer",
-                            ai=True,
-                            created_at=datetime.utcnow()
+                    # Отправляем на фронтенд по WebSocket
+                    await messages_manager.broadcast(json.dumps(message_for_frontend))
+                if "manager" in data and data["manager"] == "true":
+                    await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                    await update_chat_ai(db=session, chat_id=chat.id, ai=False)
+                    # Send WebSocket update about chat status change
+                    update_message = {
+                        "type": "chat_update",
+                        "chat_id": chat.id,
+                        "waiting": True,
+                        "ai": False
+                    }
+                    await updates_manager.broadcast(json.dumps(update_message))
+                    
+                    # Отправляем уведомление админам
+                    notification_manager = notifications.get_notification_manager()
+                    if notification_manager:
+                        await notification_manager.send_waiting_notification(
+                            chat_id=message.chat.id,
+                            chat_name=message.chat.first_name or str(message.chat.id),
+                            messager="telegram"
                         )
-                        session.add(new_answer)
-                        await session.commit()
-                        await session.refresh(new_answer)
-                        # Format message for frontend
-                        message_for_frontend = {
-                            "type": "message",
-                            "chatId": chat.id,
-                            "content": answer,
-                            "message_type": "answer",
-                            "ai": True,
-                            "timestamp": new_answer.created_at.isoformat(),
-                            "id": new_answer.id
-                        }
-                        # Отправляем на фронтенд по WebSocket
-                        await messages_manager.broadcast(json.dumps(message_for_frontend))
-                    if "manager" in data and data["manager"] == "true":
-                        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
-                        await update_chat_ai(db=session, chat_id=chat.id, ai=False)
-                        # Send WebSocket update about chat status change
-                        update_message = {
-                            "type": "chat_update",
-                            "chat_id": chat.id,
-                            "waiting": True,
-                            "ai": False
-                        }
-                        await updates_manager.broadcast(json.dumps(update_message))
-                        
-                        # Отправляем уведомление админам
-                        notification_manager = notifications.get_notification_manager()
-                        if notification_manager:
-                            await notification_manager.send_waiting_notification(
-                                chat_id=message.chat.id,
-                                chat_name=message.chat.first_name or str(message.chat.id),
-                                messager="telegram"
-                            )
+        finally:
+            if current_session != http_session:
+                await current_session.close()
 
 
             except Exception as e:

@@ -24,6 +24,8 @@ services:
       - "3001"
     environment:
       - PYTHONUNBUFFERED=1
+    volumes:
+      - backend_data:/app
     networks:
       - app_network
 
@@ -40,8 +42,8 @@ services:
     image: minio/minio
     container_name: cloud
     ports:
-      - "0.0.0.0:9000:9000"
-      - "0.0.0.0:9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     environment:
       MINIO_ROOT_USER: tim2004timi
       MINIO_ROOT_PASSWORD: timitimitimiimi
@@ -51,7 +53,6 @@ services:
     networks:
       - app_network
 
-  # === Новая БД под n8n ===
   postgres:
     image: postgres:15
     container_name: postgres
@@ -62,7 +63,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "0.0.0.0:5433:5432" # наружу 5433
+      - "127.0.0.1:5433:5432"
     networks:
       - app_network
     healthcheck:
@@ -71,7 +72,6 @@ services:
       timeout: 5s
       retries: 5
 
-  # === n8n ===
   n8n:
     image: n8nio/n8n:latest
     container_name: n8n
@@ -79,16 +79,14 @@ services:
       postgres:
         condition: service_healthy
     ports:
-      - "0.0.0.0:5678:5678"  # доступ извне без https
+      - "127.0.0.1:5678:5678"
     environment:
-      # базовые сеттингc для работы без https
-      - N8N_HOST=localhost         # замените на ваш домен/внешний IP при необходимости
+      - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
       - N8N_SECURE_COOKIE=false
       - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
       - N8N_RUNNERS_ENABLED=true
-
     volumes:
       - n8n_data:/home/node/.n8n
     networks:
@@ -99,6 +97,7 @@ volumes:
   minio_data:
   postgres_data:
   n8n_data:
+  backend_data:
 
 networks:
   app_network:
