@@ -68,6 +68,37 @@ const getAuthHeaders = () => {
   return headers;
 };
 
+// Функция для входа
+export const login = async (email: string, password: string): Promise<string> => {
+  try {
+    const response = await fetch(`${config.authUrl}/login`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Ошибка при входе');
+    }
+
+    const data = await response.json();
+    const token = data.access_token || data.token || data.access;
+    
+    if (token) {
+      localStorage.setItem('access_token', token);
+      return token;
+    } else {
+      throw new Error('Токен не получен');
+    }
+  } catch (error) {
+    console.error('Login error:', error);
+    throw error;
+  }
+};
+
 // Types
 export interface Chat {
   id: number;

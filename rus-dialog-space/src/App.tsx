@@ -9,6 +9,8 @@ import { ChatProvider } from './contexts/ChatContext';
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 import MessageBox from "./pages/MessageBox";
+import Login from "./pages/Login";
+import { Navigate } from "react-router-dom";
 
 console.log('App module loaded');
 
@@ -69,6 +71,8 @@ extractTokenFromUrl();
 const App = () => {
   console.log('App component rendering');
 
+  const isAuthenticated = !!localStorage.getItem("access_token");
+
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
@@ -78,8 +82,15 @@ const App = () => {
           <ChatProvider>
             <BrowserRouter>
               <Routes>
-                <Route path="/" element={<Index />} />
-                <Route path="/message-box" element={<MessageBox />} />
+                <Route 
+                  path="/" 
+                  element={isAuthenticated ? <Index /> : <Navigate to="/login" replace />} 
+                />
+                <Route path="/login" element={<Login />} />
+                <Route 
+                  path="/message-box" 
+                  element={isAuthenticated ? <MessageBox /> : <Navigate to="/login" replace />} 
+                />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
                 <Route path="*" element={<NotFound />} />
               </Routes>
