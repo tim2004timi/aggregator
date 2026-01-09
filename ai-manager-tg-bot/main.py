@@ -597,26 +597,38 @@ class LoginRequest(BaseModel):
     email: str
     password: str
 
-@app.post("/api/auth/login")
-async def auth_login(payload: LoginRequest):
+async def _proxy_auth_token(username: str, password: str):
     """
-    Проксирует логин на внешний auth-service.
-    Фронт ожидает /api/auth/login -> {access_token|token|access}
+    Совместимость с "рабочим проектом": auth-service принимает
+    POST /api/auth/token (application/x-www-form-urlencoded) с полями username/password.
     """
-    url = f"{auth.AUTH_SERVICE_BASE_URL}/api/auth/login"
+    url = f"{auth.AUTH_SERVICE_BASE_URL}/api/auth/token"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, json=payload.dict()) as resp:
+            async with session.post(
+                url,
+                data={"username": username, "password": password},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            ) as resp:
                 content_type = resp.headers.get("content-type", "")
                 if "application/json" in content_type:
                     data = await resp.json()
                     return JSONResponse(status_code=resp.status, content=data)
-                # fallback: plain text/html
                 text = await resp.text()
                 return JSONResponse(status_code=resp.status, content={"detail": text})
     except Exception as e:
-        logging.error(f"Auth login proxy error: {e}")
+        logging.error(f"Auth token proxy error: {e}")
         raise HTTPException(status_code=502, detail="Auth service unavailable")
+
+@app.post("/api/auth/login")
+async def auth_login(payload: LoginRequest):
+    # алиас под текущий фронт: email/password -> username/password
+    return await _proxy_auth_token(username=payload.email, password=payload.password)
+
+@app.post("/api/auth/token")
+async def auth_token(username: str = Form(...), password: str = Form(...)):
+    # точное совпадение с "рабочим проектом"
+    return await _proxy_auth_token(username=username, password=password)
 
 @app.get("/api/chats")
 @limiter.limit("60/minute")
