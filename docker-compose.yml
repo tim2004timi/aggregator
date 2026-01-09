@@ -24,6 +24,7 @@ services:
       - "3001"
     environment:
       - PYTHONUNBUFFERED=1
+      - ALLOWED_ORIGINS=http://localhost:8080,http://46.173.25.54:8080
     volumes:
       - backend_data:/app
     networks:
