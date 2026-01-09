@@ -134,14 +134,20 @@ async def get_stats(db: AsyncSession):
     return {"total": total, "pending": pending, "ai": ai_count}
 
 async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> List[Dict[str, Any]]:
+    # Подзапрос: последняя запись Message.id для каждого чата
     last_msg_ids = (
-        select(func.max(Message.id).label("last_id"))
+        select(
+            Message.chat_id.label("chat_id"),
+            func.max(Message.id).label("last_id"),
+        )
         .group_by(Message.chat_id)
         .subquery()
     )
-    
+
+    # Важно: сначала джойним по chat_id, потом подтягиваем конкретное последнее сообщение
     query = (
         select(Chat, Message)
+        .outerjoin(last_msg_ids, last_msg_ids.c.chat_id == Chat.id)
         .outerjoin(Message, Message.id == last_msg_ids.c.last_id)
         .order_by(desc(Chat.id))
     )
