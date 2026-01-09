@@ -595,7 +595,7 @@ async def updates_websocket(websocket: WebSocket):
 # Endpoints
 @app.get("/api/chats")
 @limiter.limit("60/minute")
-async def read_chats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+async def read_chats(request: Request, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chats_data = await get_chats_with_last_messages(db)
     return chats_data
 
@@ -744,7 +744,7 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
 
 @app.get("/api/stats")
 @limiter.limit("60/minute")
-async def stats(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+async def stats(request: Request, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     return await get_stats(db)
 
 class TagCreate(BaseModel):
