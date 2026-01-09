@@ -6,6 +6,8 @@ COPY package*.json ./
 RUN npm install
 
 COPY . .
+
+# Don't set VITE_WS_URL and VITE_API_URL to use dynamic window.location
 RUN npm run build
 
 FROM nginx:stable-alpine
