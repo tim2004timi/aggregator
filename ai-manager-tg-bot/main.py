@@ -404,7 +404,7 @@ async def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global http_session
-        await init_db()
+    await init_db()
     
     http_session = aiohttp.ClientSession()
     
