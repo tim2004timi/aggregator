@@ -1,10 +1,11 @@
 import aiohttp
 import logging
+import os
 from fastapi import HTTPException, Depends, Request
 from typing import Optional
 
 # Конфигурация сервиса аутентификации
-AUTH_SERVICE_BASE_URL = "http://109.172.36.219:8000"
+AUTH_SERVICE_BASE_URL = os.getenv("AUTH_SERVICE_BASE_URL", "http://109.172.36.219:8000").rstrip("/")
 CHECK_PERMISSIONS_URL = f"{AUTH_SERVICE_BASE_URL}/api/auth/me"
 
 async def check_permissions(token: str) -> bool:
