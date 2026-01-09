@@ -43,14 +43,30 @@ load_dotenv()
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 
+# VK config (делаем опциональным: отсутствие VK_* не должно валить весь API)
+VK_TOKEN = os.getenv("VK_TOKEN")  # токен сообщества
+VK_GROUP_ID_RAW = os.getenv("VK_GROUP_ID")  # ID сообщества (строкой)
+VK_GROUP_ID: Optional[int] = None
+if VK_GROUP_ID_RAW:
+    try:
+        VK_GROUP_ID = int(VK_GROUP_ID_RAW)
+    except ValueError:
+        logging.error("Invalid VK_GROUP_ID=%r (expected integer). VK integration will be disabled.", VK_GROUP_ID_RAW)
 
-VK_TOKEN = os.getenv("VK_TOKEN")        # токен сообщества
-VK_GROUP_ID = int(os.getenv("VK_GROUP_ID"))  # ID вашего сообщества
-
-# Синхронные объекты vk_api
-vk_session = vk_api.VkApi(token=VK_TOKEN)
-vk          = vk_session.get_api()
-longpoll    = VkBotLongPoll(vk_session, VK_GROUP_ID)
+# Синхронные объекты vk_api (инициализируем только если есть корректная конфигурация)
+vk_session = None
+vk = None
+longpoll = None
+if VK_TOKEN and VK_GROUP_ID:
+    try:
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        vk = vk_session.get_api()
+        longpoll = VkBotLongPoll(vk_session, VK_GROUP_ID)
+    except Exception:
+        logging.exception("Failed to initialize VK integration. VK bot will be disabled.")
+        vk_session = None
+        vk = None
+        longpoll = None
 
 # Асинхронная очередь для передачи событий из потока
 queue: asyncio.Queue = asyncio.Queue()
@@ -371,13 +387,27 @@ async def handle_single_event(event):
 
 async def start_vk_bot():
     loop = asyncio.get_running_loop()
+    if not (VK_TOKEN and VK_GROUP_ID and vk_session and longpoll):
+        logging.warning("VK integration disabled (missing/invalid VK_TOKEN or VK_GROUP_ID).")
+        return
+
     start_poller(loop)
     print("Async VK-бот запущен. Ожидаем сообщений…")
     await handle_events()
 
 
-# Initialize bot and dispatcher
-bot = get_bot()
+# Initialize bot and dispatcher (TG делаем опциональным, чтобы API не падал без BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+bot = None
+if BOT_TOKEN:
+    try:
+        bot = get_bot()
+    except Exception:
+        logging.exception("Failed to initialize Telegram bot. TG polling will be disabled.")
+        bot = None
+else:
+    logging.warning("BOT_TOKEN is not set. TG polling will be disabled.")
+
 dp = Dispatcher()
 
 # API endpoint for sending questions
@@ -408,19 +438,23 @@ async def lifespan(app: FastAPI):
     
     http_session = aiohttp.ClientSession()
     
-    notifications.init_notification_manager(bot)
+    if bot:
+        notifications.init_notification_manager(bot)
     
-    tg_task = asyncio.create_task(dp.start_polling(bot))
+    tg_task = None
+    if bot:
+        tg_task = asyncio.create_task(dp.start_polling(bot))
     
     vk_task = asyncio.create_task(start_vk_bot())
     
     yield
     
-    tg_task.cancel()
-    try:
-        await tg_task
-    except asyncio.CancelledError:
-        pass
+    if tg_task:
+        tg_task.cancel()
+        try:
+            await tg_task
+        except asyncio.CancelledError:
+            pass
 
     vk_task.cancel()
     try:
