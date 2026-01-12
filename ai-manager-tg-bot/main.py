@@ -703,27 +703,32 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
     if not chat:
         raise HTTPException(status_code=404, detail="Chat not found")
 
-    # 3. Отправляем сообщение в соответствующий мессенджер
+    # 3. Отправляем сообщение в соответствующий мессенджер (best-effort)
+    delivered = True
+    delivery_error: Optional[str] = None
     try:
         if chat.messager == "telegram":
-            # Отправка в Telegram
             if not bot:
-                raise HTTPException(status_code=503, detail="Telegram bot is not configured (BOT_TOKEN missing)")
-            tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
-            await bot.send_message(chat_id=tg_chat_id, text=msg.message)
+                delivered = False
+                delivery_error = "Telegram bot is not configured (BOT_TOKEN missing)"
+            else:
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                await bot.send_message(chat_id=tg_chat_id, text=msg.message)
         elif chat.messager == "vk":
-            # Отправка в VK
             if not vk:
-                raise HTTPException(status_code=503, detail="VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)")
-            await asyncio.to_thread(
-                vk.messages.send,
-                peer_id=int(chat.uuid),
-                message=msg.message,
-                random_id=0
-            )
+                delivered = False
+                delivery_error = "VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)"
+            else:
+                await asyncio.to_thread(
+                    vk.messages.send,
+                    peer_id=int(chat.uuid),
+                    message=msg.message,
+                    random_id=0
+                )
     except Exception as e:
+        delivered = False
+        delivery_error = str(e)
         logging.error(f"Error sending message to {chat.messager}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to send message to {chat.messager}")
 
     if msg.message_type == "answer":
         await update_chat_waiting(db, msg.chat_id, False)
@@ -750,8 +755,7 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
         "id": db_msg.id
     }
     await messages_manager.broadcast(json.dumps(message_for_frontend))
-
-    return db_msg
+    return {"message": db_msg, "delivered": delivered, "delivery_error": delivery_error}
 
 class WaitingUpdate(BaseModel):
     waiting: bool
@@ -924,11 +928,15 @@ async def upload_image(
     await db.commit()
     await db.refresh(db_img)
 
-    # 6. Отправляем фотографию в соответствующий мессенджер
+    # 6. Отправляем фотографию в соответствующий мессенджер (best-effort)
+    delivered = True
+    delivery_error: Optional[str] = None
     try:
         if chat.messager == "telegram":
             if not bot:
-                raise HTTPException(status_code=503, detail="Telegram bot is not configured (BOT_TOKEN missing)")
+                delivered = False
+                delivery_error = "Telegram bot is not configured (BOT_TOKEN missing)"
+                raise RuntimeError(delivery_error)
             # Создаем временный файл для отправки в Telegram
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
                 temp_file.write(content)
@@ -940,7 +948,9 @@ async def upload_image(
             os.unlink(temp_file.name)
         elif chat.messager == "vk":
             if not vk:
-                raise HTTPException(status_code=503, detail="VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)")
+                delivered = False
+                delivery_error = "VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)"
+                raise RuntimeError(delivery_error)
             # Загружаем фото на сервер VK
             upload_url = await asyncio.to_thread(
                 vk.photos.getMessagesUploadServer
@@ -974,8 +984,9 @@ async def upload_image(
                 random_id=0
             )
     except Exception as e:
+        delivered = False
+        delivery_error = str(e)
         logging.error(f"Error sending photo to {chat.messager}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to send photo to {chat.messager}")
 
     # 7. Отправляем сообщение через WebSocket
     message_for_frontend = {
@@ -990,7 +1001,7 @@ async def upload_image(
     }
     await messages_manager.broadcast(json.dumps(message_for_frontend))
 
-    return db_img
+    return {"message": db_img, "delivered": delivered, "delivery_error": delivery_error}
 
 @app.get("/api/ai/context")
 async def get_ai_context(_: bool = Depends(auth.require_auth)):
