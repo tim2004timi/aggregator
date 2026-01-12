@@ -439,7 +439,8 @@ async def sync_vk(db: AsyncSession, chat_id: int) -> dict:
                                                     file_size,
                                                     content_type="image/jpeg"
                                                 )
-                                                img_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+                                                # Не отдаём прямой :9000 наружу — отдаём через nginx /minio/...
+                                                img_url = f"/minio/{BUCKET_NAME}/{file_name}"
                                             except Exception as minio_error:
                                                 # Если ошибка при загрузке в MinIO, используем оригинальный URL
                                                 img_url = photo_url

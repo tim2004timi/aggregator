@@ -334,7 +334,7 @@ async def handle_single_event(event):
                         file_size,
                         content_type="image/jpeg"
                     )
-                    img_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+                    img_url = build_public_minio_url(file_name)
                     logging.info(f"Successfully uploaded to MinIO: {img_url}")
                 except Exception as e:
                     logging.error(f"MinIO upload error: {e}")
@@ -425,6 +425,16 @@ minio_client = Minio(
     secret_key=MINIO_PWD,
     secure=False  # True для HTTPS
 )
+
+def build_public_minio_url(file_name: str) -> str:
+    """
+    Не возвращаем прямой URL на :9000 (он обычно закрыт извне).
+    Отдаём через nginx по /minio/{bucket}/{object} на текущем домене.
+    """
+    public_base = os.getenv("PUBLIC_MINIO_BASE_URL")
+    if public_base:
+        return f"{public_base.rstrip('/')}/{BUCKET_NAME}/{file_name}"
+    return f"/minio/{BUCKET_NAME}/{file_name}"
 
 # Create database tables
 async def init_db():
@@ -697,12 +707,14 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
     try:
         if chat.messager == "telegram":
             # Отправка в Telegram
-            await bot.send_message(
-                chat_id=chat.uuid,
-                text=msg.message
-            )
+            if not bot:
+                raise HTTPException(status_code=503, detail="Telegram bot is not configured (BOT_TOKEN missing)")
+            tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+            await bot.send_message(chat_id=tg_chat_id, text=msg.message)
         elif chat.messager == "vk":
             # Отправка в VK
+            if not vk:
+                raise HTTPException(status_code=503, detail="VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)")
             await asyncio.to_thread(
                 vk.messages.send,
                 peer_id=int(chat.uuid),
@@ -894,7 +906,7 @@ async def upload_image(
             len(content),
             content_type="image/jpeg"
         )
-        img_url = f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}"
+        img_url = build_public_minio_url(file_name)
     except Exception as e:
         logging.error(f"MinIO upload error: {e}")
         raise HTTPException(status_code=500, detail="Failed to upload image")
@@ -912,21 +924,23 @@ async def upload_image(
     await db.commit()
     await db.refresh(db_img)
 
-        # 6. Отправляем фотографию в соответствующий мессенджер
+    # 6. Отправляем фотографию в соответствующий мессенджер
     try:
         if chat.messager == "telegram":
+            if not bot:
+                raise HTTPException(status_code=503, detail="Telegram bot is not configured (BOT_TOKEN missing)")
             # Создаем временный файл для отправки в Telegram
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
                 temp_file.write(content)
                 temp_file.flush()
                 # Отправка в Telegram
-                await bot.send_photo(
-                    chat_id=chat.uuid,
-                    photo=FSInputFile(temp_file.name)
-                )
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                await bot.send_photo(chat_id=tg_chat_id, photo=FSInputFile(temp_file.name))
             # Удаляем временный файл
             os.unlink(temp_file.name)
         elif chat.messager == "vk":
+            if not vk:
+                raise HTTPException(status_code=503, detail="VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)")
             # Загружаем фото на сервер VK
             upload_url = await asyncio.to_thread(
                 vk.photos.getMessagesUploadServer
@@ -1234,7 +1248,7 @@ async def handle_photos(message: types.Message):
             chat = await get_chat_by_uuid(session, str(message.chat.id))
             new_message = Message(
                 chat_id=chat.id,
-                message=f"http://{APP_HOST}:9000/{BUCKET_NAME}/{file_name}",
+                message=build_public_minio_url(file_name),
                 message_type="question",
                 ai=False,
                 created_at=datetime.utcnow(),
