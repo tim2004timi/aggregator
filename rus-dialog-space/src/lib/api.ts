@@ -118,7 +118,7 @@ export interface Message {
   chat_id: number;
   created_at: string;
   message: string;
-  message_type: 'question' | 'answer';
+  message_type: 'question' | 'answer' | 'text';
   ai: boolean;
   is_image: boolean;
 }
@@ -132,20 +132,28 @@ export const getChats = async (): Promise<Chat[]> => {
       return [];
     }
     
-    const chats = await response.json();
-    
-    return chats.map((chat: any) => ({
-          id: chat.id,
-          uuid: chat.uuid,
-          waiting: chat.waiting,
-          ai: chat.ai,
-      name: chat.name,
-      tags: chat.tags,
-      messager: chat.messager,
-      lastMessage: chat.last_message?.content || '',
-      lastMessageTime: chat.last_message?.timestamp || '',
-          unread: false // This should be implemented based on your business logic
-    }));
+    const chats: unknown = await response.json();
+    if (!Array.isArray(chats)) return [];
+
+    return chats.map((chat: unknown) => {
+      const c = (chat && typeof chat === 'object') ? (chat as Record<string, unknown>) : {};
+      const lastMessage = (c["last_message"] && typeof c["last_message"] === "object")
+        ? (c["last_message"] as Record<string, unknown>)
+        : null;
+
+      return {
+        id: Number(c["id"]) || 0,
+        uuid: String(c["uuid"] ?? ""),
+        waiting: Boolean(c["waiting"]),
+        ai: Boolean(c["ai"]),
+        name: String(c["name"] ?? ""),
+        tags: Array.isArray(c["tags"]) ? c["tags"].filter((t): t is string => typeof t === "string") : [],
+        messager: String(c["messager"] ?? ""),
+        lastMessage: String(lastMessage?.["content"] ?? ""),
+        lastMessageTime: String(lastMessage?.["timestamp"] ?? ""),
+        unread: false // This should be implemented based on your business logic
+      };
+    });
   } catch (error) {
     console.error('Error fetching chats:', error);
     toast.error('Не удалось загрузить список чатов');
@@ -160,16 +168,26 @@ export const getChatMessages = async (chatId: number | string): Promise<Message[
     if (!response.ok) {
       throw new Error('Failed to fetch messages');
     }
-    const messages = await response.json();
-    return messages.map((msg: any) => ({
-      id: msg.id,
-      chat_id: Number(msg.chatId || msg.chat_id),
-      created_at: msg.created_at || msg.timestamp || '',
-      message: msg.message || msg.content || '',
-      message_type: msg.message_type || 'text',
-      ai: typeof msg.ai === 'boolean' ? msg.ai : false,
-      is_image: msg.is_image || false,
-    }));
+    const messages: unknown = await response.json();
+    if (!Array.isArray(messages)) return [];
+
+    return messages.map((msg: unknown) => {
+      const m = (msg && typeof msg === 'object') ? (msg as Record<string, unknown>) : {};
+
+      const rawType = m["message_type"];
+      const message_type: Message["message_type"] =
+        rawType === "question" || rawType === "answer" || rawType === "text" ? rawType : "text";
+
+      return {
+        id: Number(m["id"]) || 0,
+        chat_id: Number(m["chatId"] ?? m["chat_id"]) || 0,
+        created_at: String(m["created_at"] ?? m["timestamp"] ?? ""),
+        message: String(m["message"] ?? m["content"] ?? ""),
+        message_type,
+        ai: typeof m["ai"] === "boolean" ? m["ai"] : false,
+        is_image: Boolean(m["is_image"]),
+      };
+    });
   } catch (error) {
     console.error('Error fetching messages:', error);
     toast.error('Не удалось загрузить сообщения');

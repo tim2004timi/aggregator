@@ -6,7 +6,7 @@ interface WebSocketContextType {
   sendMessage: (message: Message) => void;
   lastMessage: Message | null;
   isConnected: boolean;
-  lastUpdate: any;
+  lastUpdate: unknown;
 }
 
 const WebSocketContext = createContext<WebSocketContextType>({
@@ -22,7 +22,7 @@ export const WebSocketProvider: React.FC<{ children: React.ReactNode }> = ({ chi
   const [ws, setWs] = useState<WebSocket | null>(null);
   const [updatesWs, setUpdatesWs] = useState<WebSocket | null>(null);
   const [lastMessage, setLastMessage] = useState<Message | null>(null);
-  const [lastUpdate, setLastUpdate] = useState<any>(null);
+  const [lastUpdate, setLastUpdate] = useState<unknown>(null);
   const [isConnected, setIsConnected] = useState(false);
 
   useEffect(() => {

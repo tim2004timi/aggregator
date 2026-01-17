@@ -19,10 +19,11 @@ const Login = () => {
     try {
       await login(email, password);
       toast.success('Успешный вход!');
-      navigate('/');
-    } catch (error: any) {
+      navigate('/', { replace: true });
+    } catch (error: unknown) {
       console.error('Login failed:', error);
-      toast.error(error.message || 'Не удалось войти. Проверьте данные.');
+      const message = error instanceof Error ? error.message : 'Не удалось войти. Проверьте данные.';
+      toast.error(message);
     } finally {
       setIsLoading(false);
     }

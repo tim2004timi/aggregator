@@ -3,14 +3,13 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { ChatProvider } from './contexts/ChatContext';
 import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 import MessageBox from "./pages/MessageBox";
 import Login from "./pages/Login";
-import { Navigate } from "react-router-dom";
 
 console.log('App module loaded');
 
@@ -68,10 +67,26 @@ const extractTokenFromUrl = (): void => {
 // Извлекаем токен СИНХРОННО до рендеринга компонентов
 extractTokenFromUrl();
 
+const hasAccessToken = () => !!localStorage.getItem("access_token");
+
+const RequireAuth: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  if (!hasAccessToken()) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return <>{children}</>;
+};
+
+const RedirectIfAuthed: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+  if (hasAccessToken()) {
+    return <Navigate to="/" replace />;
+  }
+
+  return <>{children}</>;
+};
+
 const App = () => {
   console.log('App component rendering');
-
-  const isAuthenticated = !!localStorage.getItem("access_token");
 
   return (
     <QueryClientProvider client={queryClient}>
@@ -82,15 +97,9 @@ const App = () => {
           <ChatProvider>
             <BrowserRouter>
               <Routes>
-                <Route 
-                  path="/" 
-                  element={isAuthenticated ? <Index /> : <Navigate to="/login" replace />} 
-                />
-                <Route path="/login" element={<Login />} />
-                <Route 
-                  path="/message-box" 
-                  element={isAuthenticated ? <MessageBox /> : <Navigate to="/login" replace />} 
-                />
+                <Route path="/" element={<RequireAuth><Index /></RequireAuth>} />
+                <Route path="/login" element={<RedirectIfAuthed><Login /></RedirectIfAuthed>} />
+                <Route path="/message-box" element={<RequireAuth><MessageBox /></RequireAuth>} />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
                 <Route path="*" element={<NotFound />} />
               </Routes>
