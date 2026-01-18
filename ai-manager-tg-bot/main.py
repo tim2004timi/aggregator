@@ -38,7 +38,7 @@ import threading
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, BufferedInputFile
 import auth
 import notifications
 
@@ -864,6 +864,40 @@ def tg_product_caption(p: Dict[str, Any], color: Optional[str] = None) -> str:
     if url:
         parts.append(f'\n<a href="{html.escape(url)}">Открыть на сайте</a>')
     return "\n".join(parts).strip()
+
+async def _tg_download_as_input_file(url: str) -> Optional[Dict[str, Any]]:
+    if not url:
+        return None
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return None
+            content_type = (resp.headers.get("content-type") or "").lower()
+            data = await resp.read()
+            if not data:
+                return None
+            base = (url.split("?")[0] or "").rstrip("/")
+            ext = ""
+            if "image/png" in content_type or content_type.endswith("+png"):
+                ext = ".png"
+            elif "image/jpeg" in content_type or "image/jpg" in content_type:
+                ext = ".jpg"
+            elif "image/webp" in content_type:
+                ext = ".webp"
+            if not ext:
+                ext = Path(base).suffix.lower()
+            if not ext:
+                ext = ".jpg"
+            filename = f"image{ext}"
+            is_photo = ext in {".jpg", ".jpeg", ".png"} and content_type.startswith("image/")
+            file = BufferedInputFile(data, filename=filename)
+            return {"file": file, "is_photo": is_photo}
+    except Exception:
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
 
 
 # VK config (делаем опциональным: отсутствие VK_* не должно валить весь API)
@@ -2201,7 +2235,13 @@ async def handle_menu_callback(callback: types.CallbackQuery):
 
         caption = tg_product_caption(product, color=selected_color)
         if image_url:
-            await callback.message.answer_photo(photo=image_url, caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+            payload = await _tg_download_as_input_file(image_url)
+            if payload and payload.get("is_photo"):
+                await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+            elif payload:
+                await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+            else:
+                await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
         else:
             await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
         return
@@ -2244,12 +2284,24 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         caption = tg_product_caption(product, color=color)
         if image_url:
             try:
-                await callback.message.edit_media(
-                    types.InputMediaPhoto(media=image_url, caption=caption, parse_mode="HTML"),
-                    reply_markup=_tg_kb(kb_rows),
-                )
+                payload = await _tg_download_as_input_file(image_url)
+                if payload and payload.get("is_photo"):
+                    await callback.message.edit_media(
+                        types.InputMediaPhoto(media=payload["file"], caption=caption, parse_mode="HTML"),
+                        reply_markup=_tg_kb(kb_rows),
+                    )
+                elif payload:
+                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                else:
+                    await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
             except Exception:
-                await callback.message.answer_photo(photo=image_url, caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                payload = await _tg_download_as_input_file(image_url)
+                if payload and payload.get("is_photo"):
+                    await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                elif payload:
+                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                else:
+                    await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
         else:
             await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
         return
