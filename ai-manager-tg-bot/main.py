@@ -9,6 +9,7 @@ import os
 import re
 import html
 from pathlib import Path
+from urllib.parse import urljoin
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,10 +50,13 @@ logging.basicConfig(level=logging.INFO)
 
 FAQ_ITEMS: Dict[str, Dict[str, str]] = {}
 FAQ_ORDER: List[str] = []
+TG_FAQ_PAGE_SIZE = 12
+VK_FAQ_PAGE_SIZE = 10
 
 CATALOG_API_URL = os.getenv("CATALOG_API_URL")
+CATALOG_AUTH_TOKEN = os.getenv("CATALOG_AUTH_TOKEN")
 CATALOG_CACHE_TTL_SECONDS = int(os.getenv("CATALOG_CACHE_TTL_SECONDS", "60"))
-_catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}}
+_catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}, "color_images": {}}
 
 _user_state: Dict[str, Dict[str, Any]] = {}
 
@@ -110,27 +114,28 @@ def _parse_faq_markdown(raw: str) -> Dict[str, Dict[str, str]]:
         current_a = []
 
     for line in lines:
-        if line.strip().startswith("--- Brand Information"):
+        s = line.lstrip()
+        if s.strip().startswith("--- Brand Information"):
             flush()
             in_brand_block = True
             continue
         if in_brand_block:
-            if line.strip().startswith("--- End Brand"):
+            if s.strip().startswith("--- End Brand"):
                 in_brand_block = False
                 continue
             brand_lines.append(line)
             continue
 
-        if line.startswith("Q:"):
+        if s.startswith("Q:"):
             flush()
-            current_q = line.replace("Q:", "").strip()
+            current_q = s.replace("Q:", "").strip()
             continue
-        if line.startswith("A:"):
-            current_a.append(line.replace("A:", "").strip())
+        if s.startswith("A:"):
+            current_a.append(s.replace("A:", "").strip())
             continue
-        if line.startswith("EN:"):
+        if s.startswith("EN:"):
             continue
-        if current_q and line.strip() and not line.strip().startswith("---"):
+        if current_q and s.strip() and not s.strip().startswith("---"):
             current_a.append(line.rstrip())
 
     flush()
@@ -178,6 +183,10 @@ def load_faq() -> None:
     FAQ_ITEMS = items
     FAQ_ORDER = ordered
 
+def ensure_faq_loaded() -> None:
+    if not FAQ_ITEMS:
+        load_faq()
+
 def _tg_to_html(text: str) -> str:
     escaped = html.escape(text or "")
     escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
@@ -190,6 +199,7 @@ def _tg_faq_text() -> str:
     return "<b>FAQ</b>\n<blockquote>Выберите тему</blockquote>"
 
 def _tg_faq_item_text(item_id: str) -> str:
+    ensure_faq_loaded()
     item = FAQ_ITEMS.get(item_id)
     if not item:
         return "<b>FAQ</b>\n<blockquote>Не нашёл эту тему</blockquote>"
@@ -213,25 +223,43 @@ def tg_kb_main() -> types.InlineKeyboardMarkup:
         [{"text": "👤 Позвать менеджера", "data": "m:manager"}],
     ])
 
-def tg_kb_faq_menu() -> types.InlineKeyboardMarkup:
+def tg_kb_faq_menu(page: int = 1) -> types.InlineKeyboardMarkup:
+    ensure_faq_loaded()
+    total = len(FAQ_ORDER)
+    page_size = TG_FAQ_PAGE_SIZE
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+
     buttons: List[List[Dict[str, str]]] = []
     row: List[Dict[str, str]] = []
-    for item_id in FAQ_ORDER[:12]:
+    for item_id in FAQ_ORDER[start:end]:
         title = FAQ_ITEMS.get(item_id, {}).get("title", item_id)
         ru = title.split("(")[-1].rstrip(")") if "(" in title and ")" in title else title
         label = ru[:28]
-        row.append({"text": label, "data": f"m:faq:{item_id}"})
+        row.append({"text": label, "data": f"m:faq:item:{item_id}:{page}"})
         if len(row) == 2:
             buttons.append(row)
             row = []
     if row:
         buttons.append(row)
+    if total_pages > 1:
+        nav: List[Dict[str, str]] = []
+        if page > 1:
+            nav.append({"text": "◀️", "data": f"m:faq:page:{page - 1}"})
+        if page < total_pages:
+            nav.append({"text": "▶️", "data": f"m:faq:page:{page + 1}"})
+        if nav:
+            buttons.append(nav)
+    if not buttons:
+        buttons.append([{"text": "👤 Позвать менеджера", "data": "m:manager"}])
     buttons.append([{"text": "⬅️ Назад", "data": "m:home"}])
     return _tg_kb(buttons)
 
-def tg_kb_faq_item(item_id: str) -> types.InlineKeyboardMarkup:
+def tg_kb_faq_item(item_id: str, page: int = 1) -> types.InlineKeyboardMarkup:
     return _tg_kb([
-        [{"text": "⬅️ Назад", "data": "m:faq"}],
+        [{"text": "⬅️ Назад", "data": f"m:faq:page:{max(1, int(page or 1))}"}],
         [{"text": "👤 Позвать менеджера", "data": "m:manager"}],
         [{"text": "🏠 Меню", "data": "m:home"}],
     ])
@@ -243,6 +271,7 @@ def _vk_faq_text() -> str:
     return "FAQ\n\nВыберите тему:"
 
 def _vk_faq_item_text(item_id: str) -> str:
+    ensure_faq_loaded()
     item = FAQ_ITEMS.get(item_id)
     if not item:
         return "FAQ\n\nТема не найдена."
@@ -259,19 +288,33 @@ def vk_kb_main() -> Optional[str]:
     kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
     return kb.get_keyboard()
 
-def vk_kb_faq_menu() -> Optional[str]:
+def vk_kb_faq_menu(page: int = 1) -> Optional[str]:
+    ensure_faq_loaded()
+    total = len(FAQ_ORDER)
+    page_size = VK_FAQ_PAGE_SIZE
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    start = (page - 1) * page_size
+    end = start + page_size
+
     kb = VkKeyboard(one_time=False, inline=True)
-    for item_id in FAQ_ORDER[:10]:
+    for item_id in FAQ_ORDER[start:end]:
         title = FAQ_ITEMS.get(item_id, {}).get("title", item_id)
         ru = title.split("(")[-1].rstrip(")") if "(" in title and ")" in title else title
-        kb.add_button(ru[:38], color=VkKeyboardColor.SECONDARY, payload={"cmd": "faq_item", "id": item_id})
+        kb.add_button(ru[:38], color=VkKeyboardColor.SECONDARY, payload={"cmd": "faq_item", "id": item_id, "page": page})
+        kb.add_line()
+    if total_pages > 1:
+        if page > 1:
+            kb.add_button("◀️", color=VkKeyboardColor.PRIMARY, payload={"cmd": "faq_page", "page": page - 1})
+        if page < total_pages:
+            kb.add_button("▶️", color=VkKeyboardColor.PRIMARY, payload={"cmd": "faq_page", "page": page + 1})
         kb.add_line()
     kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "home"})
     return kb.get_keyboard()
 
-def vk_kb_faq_item(item_id: str) -> Optional[str]:
+def vk_kb_faq_item(item_id: str, page: int = 1) -> Optional[str]:
     kb = VkKeyboard(one_time=False, inline=True)
-    kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "faq"})
+    kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "faq_page", "page": max(1, int(page or 1))})
     kb.add_line()
     kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
     kb.add_line()
@@ -281,7 +324,7 @@ def vk_kb_faq_item(item_id: str) -> Optional[str]:
 def vk_kb_categories(categories: List[Dict[str, Any]]) -> Optional[str]:
     kb = VkKeyboard(one_time=False, inline=True)
     for c in categories[:6]:
-        cid = str(c.get("id") or c.get("slug") or "")
+        cid = str(c.get("slug") or "")
         name = str(c.get("name") or "Категория")[:38]
         if not cid:
             continue
@@ -414,9 +457,12 @@ async def _catalog_get_json(path: str, params: Optional[Dict[str, Any]] = None) 
     if not base:
         return None
     url = f"{base}{path}"
+    headers: Dict[str, str] = {}
+    if CATALOG_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {CATALOG_AUTH_TOKEN}"
     current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
     try:
-        async with current_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with current_session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
                 return None
             return await resp.json()
@@ -426,14 +472,52 @@ async def _catalog_get_json(path: str, params: Optional[Dict[str, Any]] = None) 
         if current_session != http_session:
             await current_session.close()
 
+def _catalog_abs_url(raw_url: str) -> str:
+    base = (CATALOG_API_URL or "").rstrip("/") + "/"
+    return urljoin(base, raw_url)
+
+def _extract_image_url(obj: Any) -> Optional[str]:
+    if isinstance(obj, str) and obj:
+        return _catalog_abs_url(obj) if not obj.startswith("http") else obj
+    if isinstance(obj, dict):
+        for k in ("url", "image_url", "src", "path", "link"):
+            v = obj.get(k)
+            if isinstance(v, str) and v:
+                return _catalog_abs_url(v) if not v.startswith("http") else v
+    return None
+
+def _flatten_categories(tree: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    stack: List[Any] = []
+    if isinstance(tree, list):
+        stack.extend(tree)
+    elif isinstance(tree, dict):
+        stack.append(tree)
+    while stack:
+        node = stack.pop()
+        if not isinstance(node, dict):
+            continue
+        slug = node.get("slug") or node.get("id")
+        name = node.get("name") or node.get("title")
+        if slug and name:
+            out.append({"slug": str(slug), "name": str(name)})
+        children = node.get("children") or node.get("items") or node.get("categories")
+        if isinstance(children, list):
+            stack.extend(children)
+    uniq: Dict[str, Dict[str, Any]] = {}
+    for c in reversed(out):
+        uniq[c["slug"]] = c
+    return list(uniq.values())
+
 async def catalog_get_categories() -> Optional[List[Dict[str, Any]]]:
     if _catalog_cache.get("categories") and _catalog_is_fresh(_catalog_cache.get("ts", 0.0)):
         return _catalog_cache["categories"]
-    data = await _catalog_get_json("/categories")
-    if isinstance(data, list):
-        _catalog_cache["categories"] = data
+    data = await _catalog_get_json("/api/categories")
+    categories = _flatten_categories(data)
+    if categories:
+        _catalog_cache["categories"] = categories
         _catalog_cache["ts"] = datetime.utcnow().timestamp()
-        return data
+        return categories
     return None
 
 def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
@@ -493,18 +577,56 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
     cached = _catalog_cache["products"].get(key)
     if cached and _catalog_is_fresh(cached["ts"]):
         return cached["data"]
-    data = await _catalog_get_json("/products", params={"category": category_id, "page": page, "limit": limit})
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        items = data["items"]
-    elif isinstance(data, list):
+
+    data = await _catalog_get_json("/api/products", params={"category": category_id, "page": page, "limit": limit})
+    used_products_endpoint = data is not None
+    if data is None:
+        data = await _catalog_get_json(f"/api/categories/{category_id}")
+    items: Any = None
+    if isinstance(data, dict):
+        items = data.get("products") or data.get("items") or data.get("data") or data.get("results")
+    if items is None:
         items = data
-    else:
+    if not isinstance(items, list):
         return None
-    normalized = []
-    for p in items:
-        np = _normalize_product(p)
-        if np:
-            normalized.append(np)
+
+    all_products: List[Dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        pid = raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid")
+        if pid is None:
+            continue
+        name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or "").strip() or str(pid)
+        description = str(raw.get("description") or raw.get("desc") or "").strip()
+        url = str(raw.get("url") or raw.get("link") or "").strip()
+        price = raw.get("price") or raw.get("cost")
+        images: List[str] = []
+        for k in ("primary_image", "image", "cover"):
+            u = _extract_image_url(raw.get(k))
+            if u:
+                images = [u]
+                break
+        if not images and isinstance(raw.get("images"), list):
+            imgs = [_extract_image_url(x) for x in raw.get("images")]
+            images = [x for x in imgs if x]
+        all_products.append({
+            "id": str(pid),
+            "name": name,
+            "description": description,
+            "url": url,
+            "price": price,
+            "images": images,
+            "colors": [],
+            "color_entries": [],
+            "images_by_color": {},
+        })
+
+    if used_products_endpoint:
+        normalized = all_products[:limit]
+    else:
+        start = max(0, (page - 1) * limit)
+        normalized = all_products[start:start + limit]
     _catalog_cache["products"][key] = {"ts": datetime.utcnow().timestamp(), "data": normalized}
     return normalized
 
@@ -512,12 +634,64 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
     cached = _catalog_cache["product"].get(product_id)
     if cached and _catalog_is_fresh(cached["ts"]):
         return cached["data"]
-    data = await _catalog_get_json(f"/products/{product_id}")
-    np = _normalize_product(data)
-    if not np:
+    base = await _catalog_get_json(f"/api/products/{product_id}")
+    if not isinstance(base, dict):
         return None
-    _catalog_cache["product"][product_id] = {"ts": datetime.utcnow().timestamp(), "data": np}
-    return np
+    pid = base.get("id") or base.get("product_id") or base.get("uuid") or product_id
+    name = str(base.get("name") or base.get("title") or base.get("product_name") or "").strip() or str(pid)
+    description = str(base.get("description") or base.get("desc") or "").strip()
+    url = str(base.get("url") or base.get("link") or "").strip()
+    price = base.get("price") or base.get("cost")
+
+    images: List[str] = []
+    for k in ("primary_image", "image", "cover"):
+        u = _extract_image_url(base.get(k))
+        if u:
+            images = [u]
+            break
+    if not images and isinstance(base.get("images"), list):
+        imgs = [_extract_image_url(x) for x in base.get("images")]
+        images = [x for x in imgs if x]
+
+    colors_data = await _catalog_get_json(f"/api/products/{product_id}/colors")
+    color_entries: List[Dict[str, Any]] = []
+    if isinstance(colors_data, list):
+        for c in colors_data:
+            if not isinstance(c, dict):
+                continue
+            cid = c.get("id") or c.get("product_color_id") or c.get("color_id")
+            cname = str(c.get("name") or c.get("title") or c.get("color") or c.get("value") or c.get("color_name") or "").strip()
+            if cid is None or not cname:
+                continue
+            color_entries.append({"id": str(cid), "name": cname})
+
+    product: Dict[str, Any] = {
+        "id": str(pid),
+        "name": name,
+        "description": description,
+        "url": url,
+        "price": price,
+        "images": images,
+        "colors": [c["name"] for c in color_entries],
+        "color_entries": color_entries,
+        "images_by_color": {},
+    }
+    _catalog_cache["product"][product_id] = {"ts": datetime.utcnow().timestamp(), "data": product}
+    return product
+
+async def catalog_get_color_images(product_color_id: str) -> List[str]:
+    cached = _catalog_cache["color_images"].get(product_color_id)
+    if cached and _catalog_is_fresh(cached["ts"]):
+        return cached["data"]
+    data = await _catalog_get_json(f"/api/products/colors/{product_color_id}/images")
+    urls: List[str] = []
+    if isinstance(data, list):
+        for it in data:
+            u = _extract_image_url(it)
+            if u:
+                urls.append(u)
+    _catalog_cache["color_images"][product_color_id] = {"ts": datetime.utcnow().timestamp(), "data": urls}
+    return urls
 
 def tg_product_caption(p: Dict[str, Any], color: Optional[str] = None) -> str:
     name = _tg_to_html(str(p.get("name") or "Товар"))
@@ -657,11 +831,16 @@ async def handle_single_event(event):
                 await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
                 return
             if cmd == "faq":
-                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu())
+                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(1))
+                return
+            if cmd == "faq_page":
+                page = int(payload_data.get("page") or 1)
+                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(page))
                 return
             if cmd == "faq_item":
                 item_id = str(payload_data.get("id") or "")
-                await vk_send_message(peer_id, _vk_faq_item_text(item_id), keyboard=vk_kb_faq_item(item_id))
+                page = int(payload_data.get("page") or 1)
+                await vk_send_message(peer_id, _vk_faq_item_text(item_id), keyboard=vk_kb_faq_item(item_id, page))
                 return
             if cmd == "cat":
                 categories = await catalog_get_categories()
@@ -689,10 +868,14 @@ async def handle_single_event(event):
                     await vk_send_message(peer_id, "Товар не найден.", keyboard=vk_kb_main())
                     return
                 colors = product.get("colors", [])
+                color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
                 selected_color = colors[0] if colors else None
                 image_url = None
-                if selected_color and product.get("images_by_color", {}).get(selected_color):
-                    image_url = product["images_by_color"][selected_color][0]
+                if color_entries:
+                    imgs = await catalog_get_color_images(color_entries[0]["id"])
+                    if imgs:
+                        product["images_by_color"][color_entries[0]["name"]] = imgs
+                        image_url = imgs[0]
                 if not image_url and product.get("images"):
                     image_url = product["images"][0]
                 attachment = await vk_upload_photo_from_url(image_url) if image_url else None
@@ -710,10 +893,14 @@ async def handle_single_event(event):
                 if not product:
                     return
                 colors = product.get("colors", [])
+                color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
                 color = colors[idx] if colors and 0 <= idx < len(colors) else (colors[0] if colors else None)
                 image_url = None
-                if color and product.get("images_by_color", {}).get(color):
-                    image_url = product["images_by_color"][color][0]
+                if color and 0 <= idx < len(color_entries):
+                    imgs = await catalog_get_color_images(color_entries[idx]["id"])
+                    if imgs:
+                        product["images_by_color"][color] = imgs
+                        image_url = imgs[0]
                 if not image_url and product.get("images"):
                     image_url = product["images"][0]
                 attachment = await vk_upload_photo_from_url(image_url) if image_url else None
@@ -1687,7 +1874,7 @@ async def cmd_menu(message: Message):
 
 @dp.message(Command("faq"))
 async def cmd_faq(message: Message):
-    await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+    await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("m:"))
 async def handle_menu_callback(callback: types.CallbackQuery):
@@ -1703,10 +1890,19 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         return
     if action == "faq":
         if len(parts) == 2:
-            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
+            return
+        if len(parts) >= 4 and parts[2] == "page" and str(parts[3]).isdigit():
+            page = int(parts[3])
+            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(page), parse_mode="HTML")
+            return
+        if len(parts) >= 5 and parts[2] == "item":
+            item_id = parts[3]
+            page = int(parts[4]) if str(parts[4]).isdigit() else 1
+            await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id, page), parse_mode="HTML")
             return
         item_id = parts[2]
-        await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id), parse_mode="HTML")
+        await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id, 1), parse_mode="HTML")
         return
     if action == "cat":
         if len(parts) == 2:
@@ -1717,7 +1913,7 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             rows: List[List[Dict[str, str]]] = []
             row: List[Dict[str, str]] = []
             for c in categories[:12]:
-                cid = str(c.get("id") or c.get("slug") or "")
+                cid = str(c.get("slug") or "")
                 name = str(c.get("name") or "Категория")[:28]
                 if not cid:
                     continue
@@ -1774,11 +1970,16 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             await callback.message.answer("Товар не найден.")
             return
         state = _get_state("tg", str(callback.message.chat.id))
+        color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
         colors: List[str] = product.get("colors", [])
-        selected_color = colors[0] if colors else None
+        selected_entry = color_entries[0] if color_entries else None
+        selected_color = selected_entry["name"] if selected_entry else (colors[0] if colors else None)
         image_url = None
-        if selected_color and product.get("images_by_color", {}).get(selected_color):
-            image_url = product["images_by_color"][selected_color][0]
+        if selected_entry:
+            imgs = await catalog_get_color_images(selected_entry["id"])
+            image_url = imgs[0] if imgs else None
+            if imgs:
+                product["images_by_color"][selected_entry["name"]] = imgs
         if not image_url and product.get("images"):
             image_url = product["images"][0]
 
@@ -1812,11 +2013,16 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         product = await catalog_get_product(product_id)
         if not product:
             return
+        color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
         colors: List[str] = product.get("colors", [])
         if not colors:
             return
         color = colors[idx] if 0 <= idx < len(colors) else colors[0]
         image_url = None
+        if 0 <= idx < len(color_entries):
+            imgs = await catalog_get_color_images(color_entries[idx]["id"])
+            if imgs:
+                product["images_by_color"][color] = imgs
         if product.get("images_by_color", {}).get(color):
             image_url = product["images_by_color"][color][0]
         if not image_url and product.get("images"):
@@ -1961,7 +2167,7 @@ async def handle_message(message: Message):
             await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
             return
         if text_norm in {"faq", "/faq"}:
-            await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+            await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
             return
         if text_norm in {"каталог", "товары", "товар"}:
             categories = await catalog_get_categories()
@@ -1971,7 +2177,7 @@ async def handle_message(message: Message):
             rows: List[List[Dict[str, str]]] = []
             row: List[Dict[str, str]] = []
             for c in categories[:12]:
-                cid = str(c.get("id") or c.get("slug") or "")
+                cid = str(c.get("slug") or "")
                 name = str(c.get("name") or "Категория")[:28]
                 if not cid:
                     continue
