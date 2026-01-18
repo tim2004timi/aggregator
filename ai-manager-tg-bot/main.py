@@ -865,6 +865,51 @@ def tg_product_caption(p: Dict[str, Any], color: Optional[str] = None) -> str:
         parts.append(f'\n<a href="{html.escape(url)}">Открыть на сайте</a>')
     return "\n".join(parts).strip()
 
+async def _tg_get_product_images(product: Dict[str, Any], product_id: str, color_idx: int) -> Dict[str, Any]:
+    color_entries: List[Dict[str, Any]] = product.get("color_entries", []) or []
+    colors: List[str] = product.get("colors", []) or []
+    idx = int(color_idx or 0)
+    if idx < 0:
+        idx = 0
+    if idx >= len(colors):
+        idx = 0
+
+    color_name = colors[idx] if colors else None
+    images: List[str] = []
+    if 0 <= idx < len(color_entries):
+        imgs = await catalog_get_color_images(str(color_entries[idx]["id"]))
+        if imgs:
+            images = imgs
+    if not images and isinstance(product.get("images"), list):
+        images = [str(x) for x in product.get("images") if x]
+    return {"color_idx": idx, "color": color_name, "images": images, "colors": colors}
+
+def _tg_product_kb(product_id: str, colors: List[str], selected_color_idx: int, img_idx: int, img_total: int, back_data: str) -> types.InlineKeyboardMarkup:
+    rows: List[List[Dict[str, str]]] = []
+    if img_total > 1:
+        prev_idx = (img_idx - 1) % img_total
+        next_idx = (img_idx + 1) % img_total
+        rows.append([
+            {"text": "◀️", "data": f"m:img:{product_id}:{selected_color_idx}:{prev_idx}"},
+            {"text": f"🖼 {img_idx + 1}/{img_total}", "data": "m:nop"},
+            {"text": "▶️", "data": f"m:img:{product_id}:{selected_color_idx}:{next_idx}"},
+        ])
+    if colors:
+        color_row: List[Dict[str, str]] = []
+        for idx, c in enumerate(colors[:6]):
+            label = ("✅ " if idx == selected_color_idx else "") + str(c)
+            color_row.append({"text": label[:18], "data": f"m:color:{product_id}:{idx}:0"})
+            if len(color_row) == 2:
+                rows.append(color_row)
+                color_row = []
+        if color_row:
+            rows.append(color_row)
+    rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
+    rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
+    rows.append([{"text": "⬅️ Назад", "data": back_data}])
+    rows.append([{"text": "🏠 Меню", "data": "m:home"}])
+    return _tg_kb(rows)
+
 async def _tg_download_as_input_file(url: str) -> Optional[Dict[str, Any]]:
     if not url:
         return None
@@ -2203,84 +2248,48 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             await callback.message.answer("Товар не найден.")
             return
         state = _get_state("tg", str(callback.message.chat.id))
-        color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
-        colors: List[str] = product.get("colors", [])
-        selected_entry = color_entries[0] if color_entries else None
-        selected_color = selected_entry["name"] if selected_entry else (colors[0] if colors else None)
-        image_url = None
-        if selected_entry:
-            imgs = await catalog_get_color_images(selected_entry["id"])
-            image_url = imgs[0] if imgs else None
-            if imgs:
-                product["images_by_color"][selected_entry["name"]] = imgs
-        if not image_url and product.get("images"):
-            image_url = product["images"][0]
-
-        kb_rows: List[List[Dict[str, str]]] = []
-        if colors:
-            color_row: List[Dict[str, str]] = []
-            for idx, c in enumerate(colors[:6]):
-                color_row.append({"text": c[:16], "data": f"m:color:{product_id}:{idx}"})
-                if len(color_row) == 2:
-                    kb_rows.append(color_row)
-                    color_row = []
-            if color_row:
-                kb_rows.append(color_row)
-        kb_rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
-        kb_rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
-        if state.get("last_category"):
-            kb_rows.append([{"text": "⬅️ Назад", "data": f"m:cat:{state['last_category']}:{state.get('last_page', 1)}"}])
-        else:
-            kb_rows.append([{"text": "⬅️ Назад", "data": "m:cat"}])
-
+        back_data = f"m:cat:{state['last_category']}:{state.get('last_page', 1)}" if state.get("last_category") else "m:cat"
+        info = await _tg_get_product_images(product, product_id, 0)
+        colors = info["colors"]
+        color_idx = info["color_idx"]
+        selected_color = info["color"]
+        images: List[str] = info["images"]
+        img_idx = 0
+        image_url = images[img_idx] if images else None
+        kb = _tg_product_kb(product_id, colors, color_idx, img_idx, len(images), back_data)
         caption = tg_product_caption(product, color=selected_color)
         if image_url:
             payload = await _tg_download_as_input_file(image_url)
             if payload and payload.get("is_photo"):
-                await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
             elif payload:
-                await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
             else:
-                await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
         else:
-            await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+            await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
         return
 
     if action == "color" and len(parts) >= 4:
         product_id = parts[2]
         idx = int(parts[3]) if str(parts[3]).isdigit() else 0
+        img_idx = int(parts[4]) if len(parts) >= 5 and str(parts[4]).isdigit() else 0
         product = await catalog_get_product(product_id)
         if not product:
             return
-        color_entries: List[Dict[str, Any]] = product.get("color_entries", [])
-        colors: List[str] = product.get("colors", [])
-        if not colors:
-            return
-        color = colors[idx] if 0 <= idx < len(colors) else colors[0]
-        image_url = None
-        if 0 <= idx < len(color_entries):
-            imgs = await catalog_get_color_images(color_entries[idx]["id"])
-            if imgs:
-                product["images_by_color"][color] = imgs
-        if product.get("images_by_color", {}).get(color):
-            image_url = product["images_by_color"][color][0]
-        if not image_url and product.get("images"):
-            image_url = product["images"][0]
-
-        kb_rows: List[List[Dict[str, str]]] = []
-        color_row: List[Dict[str, str]] = []
-        for j, c in enumerate(colors[:6]):
-            label = ("✅ " if c == color else "") + c
-            color_row.append({"text": label[:18], "data": f"m:color:{product_id}:{j}"})
-            if len(color_row) == 2:
-                kb_rows.append(color_row)
-                color_row = []
-        if color_row:
-            kb_rows.append(color_row)
-        kb_rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
-        kb_rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
-        kb_rows.append([{"text": "🏠 Меню", "data": "m:home"}])
-
+        state = _get_state("tg", str(callback.message.chat.id))
+        back_data = f"m:cat:{state['last_category']}:{state.get('last_page', 1)}" if state.get("last_category") else "m:cat"
+        info = await _tg_get_product_images(product, product_id, idx)
+        colors = info["colors"]
+        color_idx = info["color_idx"]
+        color = info["color"]
+        images: List[str] = info["images"]
+        if images:
+            img_idx = max(0, min(int(img_idx or 0), len(images) - 1))
+        else:
+            img_idx = 0
+        image_url = images[img_idx] if images else None
+        kb = _tg_product_kb(product_id, colors, color_idx, img_idx, len(images), back_data)
         caption = tg_product_caption(product, color=color)
         if image_url:
             try:
@@ -2288,22 +2297,67 @@ async def handle_menu_callback(callback: types.CallbackQuery):
                 if payload and payload.get("is_photo"):
                     await callback.message.edit_media(
                         types.InputMediaPhoto(media=payload["file"], caption=caption, parse_mode="HTML"),
-                        reply_markup=_tg_kb(kb_rows),
+                        reply_markup=kb,
                     )
                 elif payload:
-                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
                 else:
-                    await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                    await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
             except Exception:
                 payload = await _tg_download_as_input_file(image_url)
                 if payload and payload.get("is_photo"):
-                    await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                    await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
                 elif payload:
-                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                    await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
                 else:
-                    await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+                    await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
         else:
-            await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+            await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if action == "img" and len(parts) >= 5:
+        product_id = parts[2]
+        color_idx = int(parts[3]) if str(parts[3]).isdigit() else 0
+        img_idx = int(parts[4]) if str(parts[4]).isdigit() else 0
+        product = await catalog_get_product(product_id)
+        if not product:
+            return
+        state = _get_state("tg", str(callback.message.chat.id))
+        back_data = f"m:cat:{state['last_category']}:{state.get('last_page', 1)}" if state.get("last_category") else "m:cat"
+        info = await _tg_get_product_images(product, product_id, color_idx)
+        colors = info["colors"]
+        color_idx = info["color_idx"]
+        color = info["color"]
+        images: List[str] = info["images"]
+        if not images:
+            await callback.message.edit_text(tg_product_caption(product, color=color), parse_mode="HTML", reply_markup=_tg_product_kb(product_id, colors, color_idx, 0, 0, back_data))
+            return
+        img_idx = max(0, min(int(img_idx or 0), len(images) - 1))
+        image_url = images[img_idx]
+        kb = _tg_product_kb(product_id, colors, color_idx, img_idx, len(images), back_data)
+        caption = tg_product_caption(product, color=color)
+        try:
+            payload = await _tg_download_as_input_file(image_url)
+            if payload and payload.get("is_photo"):
+                await callback.message.edit_media(
+                    types.InputMediaPhoto(media=payload["file"], caption=caption, parse_mode="HTML"),
+                    reply_markup=kb,
+                )
+            elif payload:
+                await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
+            else:
+                await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            payload = await _tg_download_as_input_file(image_url)
+            if payload and payload.get("is_photo"):
+                await callback.message.answer_photo(photo=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
+            elif payload:
+                await callback.message.answer_document(document=payload["file"], caption=caption, parse_mode="HTML", reply_markup=kb)
+            else:
+                await callback.message.answer(caption, parse_mode="HTML", reply_markup=kb)
+        return
+
+    if action == "nop":
         return
 
     if action == "ask" and len(parts) >= 3:
@@ -2445,11 +2499,13 @@ async def handle_message(message: Message):
         force_manager = "позови менеджера" in text_norm or text_norm == "менеджер"
         state = _get_state("tg", str(message.chat.id))
         ai_question = message.text
+        force_ai = False
         if state.get("mode") == "ask_ai_product" and state.get("product"):
             p = state["product"]
             context = f"Контекст товара:\nНазвание: {p.get('name','')}\nОписание: {p.get('description','')}\nЦвета: {', '.join(p.get('colors', []))}\nСсылка: {p.get('url','')}"
             ai_question = f"{context}\n\nВопрос пользователя: {message.text}"
             _clear_state("tg", str(message.chat.id))
+            force_ai = True
 
         new_message = Message(
             chat_id=chat.id,
@@ -2492,7 +2548,7 @@ async def handle_message(message: Message):
             await message.answer("Я позвал менеджера. Напишите, что нужно — он подключится.", reply_markup=tg_kb_main())
             return
 
-        if not chat.ai:
+        if not chat.ai and not force_ai:
             await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
             update_message = {
                 "type": "chat_update",
