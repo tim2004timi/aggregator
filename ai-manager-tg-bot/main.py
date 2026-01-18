@@ -6,6 +6,9 @@ from aiogram.types import Message
 import aiohttp
 from dotenv import load_dotenv
 import os
+import re
+import html
+from pathlib import Path
 import uvicorn
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,6 +36,7 @@ import tempfile
 import threading
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from aiogram.types import FSInputFile
 import auth
 import notifications
@@ -42,6 +46,495 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
+
+FAQ_ITEMS: Dict[str, Dict[str, str]] = {}
+FAQ_ORDER: List[str] = []
+
+CATALOG_API_URL = os.getenv("CATALOG_API_URL")
+CATALOG_CACHE_TTL_SECONDS = int(os.getenv("CATALOG_CACHE_TTL_SECONDS", "60"))
+_catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}}
+
+_user_state: Dict[str, Dict[str, Any]] = {}
+
+def _state_key(platform: str, peer_id: str) -> str:
+    return f"{platform}:{peer_id}"
+
+def _get_state(platform: str, peer_id: str) -> Dict[str, Any]:
+    return _user_state.setdefault(_state_key(platform, peer_id), {})
+
+def _clear_state(platform: str, peer_id: str) -> None:
+    _user_state.pop(_state_key(platform, peer_id), None)
+
+def _normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+def _faq_slug(text: str) -> str:
+    base = _normalize(text)
+    base = re.sub(r"[^a-z0-9]+", "_", base)
+    return base.strip("_") or "faq"
+
+def _find_faq_file() -> Optional[Path]:
+    candidates: List[Optional[str]] = [
+        os.getenv("FAQ_FILE"),
+        "/app/faq.md",
+        str(Path(__file__).resolve().parent / "faq.md"),
+        str(Path.cwd() / "faq.md"),
+        str(Path(__file__).resolve().parent.parent / "faq.md"),
+    ]
+    for c in candidates:
+        if not c:
+            continue
+        p = Path(c)
+        if p.exists() and p.is_file():
+            return p
+    return None
+
+def _parse_faq_markdown(raw: str) -> Dict[str, Dict[str, str]]:
+    items: Dict[str, Dict[str, str]] = {}
+    lines = (raw or "").splitlines()
+    current_q: Optional[str] = None
+    current_a: List[str] = []
+    in_brand_block = False
+    brand_lines: List[str] = []
+
+    def flush() -> None:
+        nonlocal current_q, current_a
+        if not current_q:
+            return
+        answer = "\n".join([l.rstrip() for l in current_a if l.strip()])
+        if answer:
+            slug = _faq_slug(current_q.split("(")[0].replace("Q:", "").strip().rstrip("?"))
+            if slug not in items:
+                items[slug] = {"title": current_q.strip(), "answer": answer.strip()}
+        current_q = None
+        current_a = []
+
+    for line in lines:
+        if line.strip().startswith("--- Brand Information"):
+            flush()
+            in_brand_block = True
+            continue
+        if in_brand_block:
+            if line.strip().startswith("--- End Brand"):
+                in_brand_block = False
+                continue
+            brand_lines.append(line)
+            continue
+
+        if line.startswith("Q:"):
+            flush()
+            current_q = line.replace("Q:", "").strip()
+            continue
+        if line.startswith("A:"):
+            current_a.append(line.replace("A:", "").strip())
+            continue
+        if line.startswith("EN:"):
+            continue
+        if current_q and line.strip() and not line.strip().startswith("---"):
+            current_a.append(line.rstrip())
+
+    flush()
+
+    brand_text = "\n".join([l.rstrip() for l in brand_lines if l.strip()]).strip()
+    if brand_text:
+        items["brand_info"] = {"title": "О бренде ПСИХ", "answer": brand_text}
+
+    return items
+
+def load_faq() -> None:
+    global FAQ_ITEMS, FAQ_ORDER
+    p = _find_faq_file()
+    if not p:
+        FAQ_ITEMS = {}
+        FAQ_ORDER = []
+        return
+    raw = p.read_text(encoding="utf-8", errors="ignore")
+    items = _parse_faq_markdown(raw)
+    preferred_order = [
+        "delivery_time",
+        "tell_me_the_status_of_order_xxxxx",
+        "what_is_pre_order",
+        "how_long_is_pre_order",
+        "return_policy",
+        "size_guide",
+        "why_is_shipping_delayed",
+        "is_it_a_pre_order",
+        "what_if_my_order_has_both_pre_order_and_in_stock_items",
+        "international_shipping",
+        "which_carriers_do_you_use",
+        "how_do_i_choose_a_size",
+        "which_items_are_non_returnable",
+        "how_should_i_care_for_psih_items",
+        "what_if_my_item_is_defective",
+        "brand_info",
+    ]
+    ordered: List[str] = []
+    for key in preferred_order:
+        if key in items:
+            ordered.append(key)
+    for key in items.keys():
+        if key not in ordered:
+            ordered.append(key)
+    FAQ_ITEMS = items
+    FAQ_ORDER = ordered
+
+def _tg_to_html(text: str) -> str:
+    escaped = html.escape(text or "")
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+    return escaped
+
+def _tg_main_text() -> str:
+    return "<b>PSIH</b>\n<blockquote>Выберите раздел ниже или просто напишите вопрос</blockquote>"
+
+def _tg_faq_text() -> str:
+    return "<b>FAQ</b>\n<blockquote>Выберите тему</blockquote>"
+
+def _tg_faq_item_text(item_id: str) -> str:
+    item = FAQ_ITEMS.get(item_id)
+    if not item:
+        return "<b>FAQ</b>\n<blockquote>Не нашёл эту тему</blockquote>"
+    title = _tg_to_html(item["title"])
+    answer = _tg_to_html(item["answer"])
+    return f"<b>{title}</b>\n\n<blockquote>{answer}</blockquote>"
+
+def _tg_kb(rows: List[List[Dict[str, str]]]) -> types.InlineKeyboardMarkup:
+    inline_keyboard: List[List[types.InlineKeyboardButton]] = []
+    for row in rows:
+        inline_keyboard.append([
+            types.InlineKeyboardButton(text=b["text"], callback_data=b["data"])
+            for b in row
+        ])
+    return types.InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+def tg_kb_main() -> types.InlineKeyboardMarkup:
+    return _tg_kb([
+        [{"text": "🛍️ Товары", "data": "m:cat"}],
+        [{"text": "📌 FAQ", "data": "m:faq"}],
+        [{"text": "👤 Позвать менеджера", "data": "m:manager"}],
+    ])
+
+def tg_kb_faq_menu() -> types.InlineKeyboardMarkup:
+    buttons: List[List[Dict[str, str]]] = []
+    row: List[Dict[str, str]] = []
+    for item_id in FAQ_ORDER[:12]:
+        title = FAQ_ITEMS.get(item_id, {}).get("title", item_id)
+        ru = title.split("(")[-1].rstrip(")") if "(" in title and ")" in title else title
+        label = ru[:28]
+        row.append({"text": label, "data": f"m:faq:{item_id}"})
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([{"text": "⬅️ Назад", "data": "m:home"}])
+    return _tg_kb(buttons)
+
+def tg_kb_faq_item(item_id: str) -> types.InlineKeyboardMarkup:
+    return _tg_kb([
+        [{"text": "⬅️ Назад", "data": "m:faq"}],
+        [{"text": "👤 Позвать менеджера", "data": "m:manager"}],
+        [{"text": "🏠 Меню", "data": "m:home"}],
+    ])
+
+def _vk_main_text() -> str:
+    return "PSIH\n\nВыберите раздел ниже или просто напишите вопрос."
+
+def _vk_faq_text() -> str:
+    return "FAQ\n\nВыберите тему:"
+
+def _vk_faq_item_text(item_id: str) -> str:
+    item = FAQ_ITEMS.get(item_id)
+    if not item:
+        return "FAQ\n\nТема не найдена."
+    title = item["title"]
+    answer = item["answer"]
+    return f"{title}\n\n«{answer}»"
+
+def vk_kb_main() -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    kb.add_button("🛍️ Товары", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat"})
+    kb.add_line()
+    kb.add_button("📌 FAQ", color=VkKeyboardColor.SECONDARY, payload={"cmd": "faq"})
+    kb.add_line()
+    kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
+    return kb.get_keyboard()
+
+def vk_kb_faq_menu() -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    for item_id in FAQ_ORDER[:10]:
+        title = FAQ_ITEMS.get(item_id, {}).get("title", item_id)
+        ru = title.split("(")[-1].rstrip(")") if "(" in title and ")" in title else title
+        kb.add_button(ru[:38], color=VkKeyboardColor.SECONDARY, payload={"cmd": "faq_item", "id": item_id})
+        kb.add_line()
+    kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "home"})
+    return kb.get_keyboard()
+
+def vk_kb_faq_item(item_id: str) -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "faq"})
+    kb.add_line()
+    kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
+    kb.add_line()
+    kb.add_button("🏠 Меню", color=VkKeyboardColor.SECONDARY, payload={"cmd": "home"})
+    return kb.get_keyboard()
+
+def vk_kb_categories(categories: List[Dict[str, Any]]) -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    for c in categories[:6]:
+        cid = str(c.get("id") or c.get("slug") or "")
+        name = str(c.get("name") or "Категория")[:38]
+        if not cid:
+            continue
+        kb.add_button(name, color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": cid, "page": 1})
+        kb.add_line()
+    kb.add_button("🏠 Меню", color=VkKeyboardColor.SECONDARY, payload={"cmd": "home"})
+    return kb.get_keyboard()
+
+def vk_kb_products(category_id: str, page: int, products: List[Dict[str, Any]], has_next: bool) -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    for p in products[:6]:
+        kb.add_button(str(p.get("name") or "Товар")[:38], color=VkKeyboardColor.SECONDARY, payload={"cmd": "prod", "id": p.get("id"), "cat": category_id, "page": page})
+        kb.add_line()
+    nav_added = False
+    if page > 1:
+        kb.add_button("⬅️", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": category_id, "page": page - 1})
+        nav_added = True
+    if has_next:
+        if nav_added:
+            kb.add_button("➡️", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": category_id, "page": page + 1})
+        else:
+            kb.add_button("➡️", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": category_id, "page": page + 1})
+        nav_added = True
+    if nav_added:
+        kb.add_line()
+    kb.add_button("⬅️ Категории", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat"})
+    kb.add_line()
+    kb.add_button("🏠 Меню", color=VkKeyboardColor.SECONDARY, payload={"cmd": "home"})
+    return kb.get_keyboard()
+
+def vk_kb_product(product_id: str, category_id: Optional[str] = None, page: Optional[int] = None, colors: Optional[List[str]] = None) -> Optional[str]:
+    kb = VkKeyboard(one_time=False, inline=True)
+    if colors:
+        for idx, c in enumerate(colors[:6]):
+            kb.add_button(c[:38], color=VkKeyboardColor.SECONDARY, payload={"cmd": "color", "id": product_id, "ci": idx, "cat": category_id, "page": page})
+            kb.add_line()
+    kb.add_button("🧠 Спросить ИИ", color=VkKeyboardColor.PRIMARY, payload={"cmd": "ask_ai", "id": product_id})
+    kb.add_line()
+    kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
+    kb.add_line()
+    if category_id and page:
+        kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": category_id, "page": page})
+    else:
+        kb.add_button("⬅️ Каталог", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat"})
+    kb.add_line()
+    kb.add_button("🏠 Меню", color=VkKeyboardColor.SECONDARY, payload={"cmd": "home"})
+    return kb.get_keyboard()
+
+async def vk_send_message(peer_id: int, message: str, keyboard: Optional[str] = None, attachment: Optional[str] = None) -> None:
+    if not vk:
+        return
+    payload: Dict[str, Any] = {"peer_id": peer_id, "message": message, "random_id": 0}
+    if keyboard:
+        payload["keyboard"] = keyboard
+    if attachment:
+        payload["attachment"] = attachment
+    await asyncio.to_thread(vk.messages.send, **payload)
+
+_vk_photo_cache: Dict[str, Dict[str, Any]] = {}
+
+async def vk_upload_photo_from_url(url: str) -> Optional[str]:
+    if not vk or not url:
+        return None
+    cached = _vk_photo_cache.get(url)
+    if cached and _catalog_is_fresh(cached.get("ts", 0.0)):
+        return cached.get("attachment")
+
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    content: Optional[bytes] = None
+    try:
+        async with current_session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return None
+            content = await resp.read()
+    except Exception:
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
+    try:
+        upload_url = await asyncio.to_thread(vk.photos.getMessagesUploadServer)
+        upload_url = upload_url["upload_url"]
+        current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+        try:
+            form = aiohttp.FormData()
+            form.add_field("photo", content, filename="photo.jpg", content_type="image/jpeg")
+            async with current_session.post(upload_url, data=form, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200:
+                    return None
+                upload_result = await resp.json()
+        finally:
+            if current_session != http_session:
+                await current_session.close()
+
+        photo_data = await asyncio.to_thread(
+            vk.photos.saveMessagesPhoto,
+            photo=upload_result["photo"],
+            server=upload_result["server"],
+            hash=upload_result["hash"],
+        )
+        att = f"photo{photo_data[0]['owner_id']}_{photo_data[0]['id']}"
+        _vk_photo_cache[url] = {"ts": datetime.utcnow().timestamp(), "attachment": att}
+        return att
+    except Exception:
+        return None
+
+async def request_manager(db: AsyncSession, chat_id: int, peer_id: str, chat_name: str, messager: str) -> None:
+    await update_chat_waiting(db=db, chat_id=chat_id, waiting=True)
+    await update_chat_ai(db=db, chat_id=chat_id, ai=False)
+    await updates_manager.broadcast(json.dumps({
+        "type": "chat_update",
+        "chat_id": chat_id,
+        "waiting": True,
+        "ai": False
+    }))
+    notification_manager = notifications.get_notification_manager()
+    if notification_manager:
+        await notification_manager.send_waiting_notification(
+            chat_id=int(peer_id) if str(peer_id).isdigit() else peer_id,
+            chat_name=chat_name,
+            messager=messager
+        )
+
+def _catalog_is_fresh(ts: float) -> bool:
+    return (datetime.utcnow().timestamp() - ts) < CATALOG_CACHE_TTL_SECONDS
+
+async def _catalog_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    base = (CATALOG_API_URL or "").rstrip("/")
+    if not base:
+        return None
+    url = f"{base}{path}"
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json()
+    except Exception:
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
+async def catalog_get_categories() -> Optional[List[Dict[str, Any]]]:
+    if _catalog_cache.get("categories") and _catalog_is_fresh(_catalog_cache.get("ts", 0.0)):
+        return _catalog_cache["categories"]
+    data = await _catalog_get_json("/categories")
+    if isinstance(data, list):
+        _catalog_cache["categories"] = data
+        _catalog_cache["ts"] = datetime.utcnow().timestamp()
+        return data
+    return None
+
+def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+    pid = raw.get("id") or raw.get("product_id") or raw.get("uuid") or raw.get("slug")
+    if pid is None:
+        return None
+    name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or "").strip() or str(pid)
+    description = str(raw.get("description") or raw.get("desc") or "").strip()
+    url = str(raw.get("url") or raw.get("link") or "").strip()
+    price = raw.get("price") or raw.get("cost")
+
+    images: List[str] = []
+    if isinstance(raw.get("images"), list):
+        images = [str(x) for x in raw.get("images") if x]
+    elif isinstance(raw.get("image"), str) and raw.get("image"):
+        images = [raw.get("image")]
+
+    colors: List[str] = []
+    images_by_color: Dict[str, List[str]] = {}
+
+    raw_colors = raw.get("colors")
+    if isinstance(raw_colors, list):
+        for c in raw_colors:
+            if isinstance(c, str):
+                colors.append(c)
+            elif isinstance(c, dict):
+                cname = str(c.get("name") or c.get("title") or c.get("color") or "").strip()
+                if cname:
+                    colors.append(cname)
+                cimgs: List[str] = []
+                if isinstance(c.get("images"), list):
+                    cimgs = [str(x) for x in c.get("images") if x]
+                if cname and cimgs:
+                    images_by_color[cname] = cimgs
+
+    raw_color_images = raw.get("color_images")
+    if isinstance(raw_color_images, dict):
+        for k, v in raw_color_images.items():
+            if isinstance(v, list):
+                images_by_color[str(k)] = [str(x) for x in v if x]
+
+    return {
+        "id": str(pid),
+        "name": name,
+        "description": description,
+        "url": url,
+        "price": price,
+        "images": images,
+        "colors": colors,
+        "images_by_color": images_by_color,
+    }
+
+async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) -> Optional[List[Dict[str, Any]]]:
+    key = f"{category_id}:{page}:{limit}"
+    cached = _catalog_cache["products"].get(key)
+    if cached and _catalog_is_fresh(cached["ts"]):
+        return cached["data"]
+    data = await _catalog_get_json("/products", params={"category": category_id, "page": page, "limit": limit})
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        items = data["items"]
+    elif isinstance(data, list):
+        items = data
+    else:
+        return None
+    normalized = []
+    for p in items:
+        np = _normalize_product(p)
+        if np:
+            normalized.append(np)
+    _catalog_cache["products"][key] = {"ts": datetime.utcnow().timestamp(), "data": normalized}
+    return normalized
+
+async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
+    cached = _catalog_cache["product"].get(product_id)
+    if cached and _catalog_is_fresh(cached["ts"]):
+        return cached["data"]
+    data = await _catalog_get_json(f"/products/{product_id}")
+    np = _normalize_product(data)
+    if not np:
+        return None
+    _catalog_cache["product"][product_id] = {"ts": datetime.utcnow().timestamp(), "data": np}
+    return np
+
+def tg_product_caption(p: Dict[str, Any], color: Optional[str] = None) -> str:
+    name = _tg_to_html(str(p.get("name") or "Товар"))
+    desc = _tg_to_html(str(p.get("description") or ""))
+    url = str(p.get("url") or "")
+    price = p.get("price")
+    parts = [f"<b>{name}</b>"]
+    if price is not None and str(price).strip():
+        parts.append(f"<b>Цена:</b> {html.escape(str(price))}")
+    if color:
+        parts.append(f"<b>Цвет:</b> {html.escape(color)}")
+    if desc:
+        parts.append(f"\n<blockquote>{desc}</blockquote>")
+    if url:
+        parts.append(f'\n<a href="{html.escape(url)}">Открыть на сайте</a>')
+    return "\n".join(parts).strip()
+
 
 # VK config (делаем опциональным: отсутствие VK_* не должно валить весь API)
 VK_TOKEN = os.getenv("VK_TOKEN")  # токен сообщества
@@ -150,6 +643,128 @@ async def handle_single_event(event):
             }
             await updates_manager.broadcast(json.dumps(new_chat_message))
 
+        payload_raw = msg.get("payload")
+        payload_data: Optional[Dict[str, Any]] = None
+        if payload_raw:
+            try:
+                payload_data = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
+            except Exception:
+                payload_data = None
+
+        if payload_data and isinstance(payload_data, dict) and payload_data.get("cmd"):
+            cmd = str(payload_data.get("cmd"))
+            if cmd == "home":
+                await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
+                return
+            if cmd == "faq":
+                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu())
+                return
+            if cmd == "faq_item":
+                item_id = str(payload_data.get("id") or "")
+                await vk_send_message(peer_id, _vk_faq_item_text(item_id), keyboard=vk_kb_faq_item(item_id))
+                return
+            if cmd == "cat":
+                categories = await catalog_get_categories()
+                if not categories:
+                    await vk_send_message(peer_id, "Каталог пока недоступен.", keyboard=vk_kb_main())
+                    return
+                await vk_send_message(peer_id, "Каталог\n\nВыберите категорию:", keyboard=vk_kb_categories(categories))
+                return
+            if cmd == "cat_open":
+                category_id = str(payload_data.get("id") or "")
+                page = int(payload_data.get("page") or 1)
+                limit = 6
+                items = await catalog_get_products(category_id, page=page, limit=limit)
+                if not items:
+                    await vk_send_message(peer_id, "Каталог пустой или API недоступен.", keyboard=vk_kb_main())
+                    return
+                await vk_send_message(peer_id, f"Каталог\n\nСтраница {page}", keyboard=vk_kb_products(category_id, page, items, has_next=len(items) >= limit))
+                return
+            if cmd == "prod":
+                product_id = str(payload_data.get("id") or "")
+                category_id = str(payload_data.get("cat") or "") or None
+                page = int(payload_data.get("page") or 1) if payload_data.get("page") else None
+                product = await catalog_get_product(product_id)
+                if not product:
+                    await vk_send_message(peer_id, "Товар не найден.", keyboard=vk_kb_main())
+                    return
+                colors = product.get("colors", [])
+                selected_color = colors[0] if colors else None
+                image_url = None
+                if selected_color and product.get("images_by_color", {}).get(selected_color):
+                    image_url = product["images_by_color"][selected_color][0]
+                if not image_url and product.get("images"):
+                    image_url = product["images"][0]
+                attachment = await vk_upload_photo_from_url(image_url) if image_url else None
+                text_out = f"{product.get('name','Товар')}\n\n{product.get('description','')}"
+                if product.get("url"):
+                    text_out += f"\n\nСсылка: {product.get('url')}"
+                await vk_send_message(peer_id, text_out.strip(), keyboard=vk_kb_product(product_id, category_id=category_id, page=page, colors=colors), attachment=attachment)
+                return
+            if cmd == "color":
+                product_id = str(payload_data.get("id") or "")
+                idx = int(payload_data.get("ci") or 0)
+                category_id = str(payload_data.get("cat") or "") or None
+                page = int(payload_data.get("page") or 1) if payload_data.get("page") else None
+                product = await catalog_get_product(product_id)
+                if not product:
+                    return
+                colors = product.get("colors", [])
+                color = colors[idx] if colors and 0 <= idx < len(colors) else (colors[0] if colors else None)
+                image_url = None
+                if color and product.get("images_by_color", {}).get(color):
+                    image_url = product["images_by_color"][color][0]
+                if not image_url and product.get("images"):
+                    image_url = product["images"][0]
+                attachment = await vk_upload_photo_from_url(image_url) if image_url else None
+                text_out = f"{product.get('name','Товар')}"
+                if color:
+                    text_out += f"\nЦвет: {color}"
+                if product.get("url"):
+                    text_out += f"\n\nСсылка: {product.get('url')}"
+                await vk_send_message(peer_id, text_out.strip(), keyboard=vk_kb_product(product_id, category_id=category_id, page=page, colors=colors), attachment=attachment)
+                return
+            if cmd == "ask_ai":
+                product_id = str(payload_data.get("id") or "")
+                product = await catalog_get_product(product_id)
+                if not product:
+                    await vk_send_message(peer_id, "Товар не найден.", keyboard=vk_kb_main())
+                    return
+                state = _get_state("vk", str(peer_id))
+                state["mode"] = "ask_ai_product"
+                state["product"] = {
+                    "id": product.get("id"),
+                    "name": product.get("name"),
+                    "description": product.get("description"),
+                    "colors": product.get("colors", []),
+                    "url": product.get("url"),
+                }
+                await vk_send_message(peer_id, "Напишите вопрос по этому товару — я отвечу с учётом описания и цветов.", keyboard=vk_kb_main())
+                return
+            if cmd == "manager":
+                await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+                await vk_send_message(peer_id, "Я позвал менеджера. Напишите, что нужно — он подключится.", keyboard=vk_kb_main())
+                return
+
+        text_norm = _normalize(text)
+        if text_norm in {"меню", "menu", "/menu", "старт", "start"}:
+            await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
+            return
+        if text_norm in {"faq", "/faq"}:
+            await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu())
+            return
+        if text_norm in {"каталог", "товары", "товар"}:
+            categories = await catalog_get_categories()
+            if not categories:
+                await vk_send_message(peer_id, "Каталог пока недоступен.", keyboard=vk_kb_main())
+                return
+            await vk_send_message(peer_id, "Каталог\n\nВыберите категорию:", keyboard=vk_kb_categories(categories))
+            return
+        if "позови менеджера" in text_norm or text_norm == "менеджер":
+            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+            await vk_send_message(peer_id, "Я позвал менеджера. Напишите, что нужно — он подключится.", keyboard=vk_kb_main())
+            return
+
         # --- 2) Текстовое сообщение ---
         if text:
             # Создаём запись вопроса
@@ -194,11 +809,18 @@ async def handle_single_event(event):
                         messager="vk"
                     )
             else:
+                state = _get_state("vk", str(peer_id))
+                ai_question = text
+                if state.get("mode") == "ask_ai_product" and state.get("product"):
+                    p = state["product"]
+                    context = f"Контекст товара:\nНазвание: {p.get('name','')}\nОписание: {p.get('description','')}\nЦвета: {', '.join(p.get('colors', []))}\nСсылка: {p.get('url','')}"
+                    ai_question = f"{context}\n\nВопрос пользователя: {text}"
+                    _clear_state("vk", str(peer_id))
                 current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
                 try:
                     async with current_session.post(
                         API_URL,
-                        json={"question": text, "chat_id": chat.id}
+                        json={"question": ai_question, "chat_id": chat.id}
                     ) as resp:
                         data = await resp.json()
                     
@@ -445,6 +1067,7 @@ async def init_db():
 async def lifespan(app: FastAPI):
     global http_session
     await init_db()
+    load_faq()
     
     http_session = aiohttp.ClientSession()
     
@@ -1056,10 +1679,215 @@ async def cmd_start(message: Message):
             return
     
     # Обычное приветствие для обычных пользователей
-    await message.answer(
-        "Добро пожаловать в Psihclothes!\n"
-        "Можете задать любой вопрос"
-    )
+    await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
+
+@dp.message(Command("menu"))
+async def cmd_menu(message: Message):
+    await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
+
+@dp.message(Command("faq"))
+async def cmd_faq(message: Message):
+    await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("m:"))
+async def handle_menu_callback(callback: types.CallbackQuery):
+    parts = (callback.data or "").split(":")
+    if len(parts) < 2:
+        await callback.answer()
+        return
+    action = parts[1]
+    await callback.answer()
+
+    if action == "home":
+        await callback.message.edit_text(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
+        return
+    if action == "faq":
+        if len(parts) == 2:
+            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+            return
+        item_id = parts[2]
+        await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id), parse_mode="HTML")
+        return
+    if action == "cat":
+        if len(parts) == 2:
+            categories = await catalog_get_categories()
+            if not categories:
+                await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Пока недоступен</blockquote>", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:home"}]]), parse_mode="HTML")
+                return
+            rows: List[List[Dict[str, str]]] = []
+            row: List[Dict[str, str]] = []
+            for c in categories[:12]:
+                cid = str(c.get("id") or c.get("slug") or "")
+                name = str(c.get("name") or "Категория")[:28]
+                if not cid:
+                    continue
+                row.append({"text": name, "data": f"m:cat:{cid}:1"})
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            rows.append([{"text": "⬅️ Назад", "data": "m:home"}])
+            await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", reply_markup=_tg_kb(rows), parse_mode="HTML")
+            return
+
+        category_id = parts[2]
+        page = 1
+        if len(parts) >= 4 and str(parts[3]).isdigit():
+            page = int(parts[3])
+        limit = 8
+        items = await catalog_get_products(category_id, page=page, limit=limit)
+        if not items:
+            await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Пусто или API недоступен</blockquote>", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]), parse_mode="HTML")
+            return
+
+        state = _get_state("tg", str(callback.message.chat.id))
+        state["last_category"] = category_id
+        state["last_page"] = page
+
+        rows: List[List[Dict[str, str]]] = []
+        row: List[Dict[str, str]] = []
+        for p in items:
+            row.append({"text": str(p.get("name") or "Товар")[:28], "data": f"m:prod:{p['id']}"})
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+        nav_row: List[Dict[str, str]] = []
+        if page > 1:
+            nav_row.append({"text": "⬅️", "data": f"m:cat:{category_id}:{page-1}"})
+        if len(items) >= limit:
+            nav_row.append({"text": "➡️", "data": f"m:cat:{category_id}:{page+1}"})
+        if nav_row:
+            rows.append(nav_row)
+        rows.append([{"text": "⬅️ Категории", "data": "m:cat"}])
+        rows.append([{"text": "🏠 Меню", "data": "m:home"}])
+        await callback.message.edit_text(f"<b>Каталог</b>\n<blockquote>Страница {page}</blockquote>", reply_markup=_tg_kb(rows), parse_mode="HTML")
+        return
+
+    if action == "prod" and len(parts) >= 3:
+        product_id = parts[2]
+        product = await catalog_get_product(product_id)
+        if not product:
+            await callback.message.answer("Товар не найден.")
+            return
+        state = _get_state("tg", str(callback.message.chat.id))
+        colors: List[str] = product.get("colors", [])
+        selected_color = colors[0] if colors else None
+        image_url = None
+        if selected_color and product.get("images_by_color", {}).get(selected_color):
+            image_url = product["images_by_color"][selected_color][0]
+        if not image_url and product.get("images"):
+            image_url = product["images"][0]
+
+        kb_rows: List[List[Dict[str, str]]] = []
+        if colors:
+            color_row: List[Dict[str, str]] = []
+            for idx, c in enumerate(colors[:6]):
+                color_row.append({"text": c[:16], "data": f"m:color:{product_id}:{idx}"})
+                if len(color_row) == 2:
+                    kb_rows.append(color_row)
+                    color_row = []
+            if color_row:
+                kb_rows.append(color_row)
+        kb_rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
+        kb_rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
+        if state.get("last_category"):
+            kb_rows.append([{"text": "⬅️ Назад", "data": f"m:cat:{state['last_category']}:{state.get('last_page', 1)}"}])
+        else:
+            kb_rows.append([{"text": "⬅️ Назад", "data": "m:cat"}])
+
+        caption = tg_product_caption(product, color=selected_color)
+        if image_url:
+            await callback.message.answer_photo(photo=image_url, caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+        else:
+            await callback.message.answer(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+        return
+
+    if action == "color" and len(parts) >= 4:
+        product_id = parts[2]
+        idx = int(parts[3]) if str(parts[3]).isdigit() else 0
+        product = await catalog_get_product(product_id)
+        if not product:
+            return
+        colors: List[str] = product.get("colors", [])
+        if not colors:
+            return
+        color = colors[idx] if 0 <= idx < len(colors) else colors[0]
+        image_url = None
+        if product.get("images_by_color", {}).get(color):
+            image_url = product["images_by_color"][color][0]
+        if not image_url and product.get("images"):
+            image_url = product["images"][0]
+
+        kb_rows: List[List[Dict[str, str]]] = []
+        color_row: List[Dict[str, str]] = []
+        for j, c in enumerate(colors[:6]):
+            label = ("✅ " if c == color else "") + c
+            color_row.append({"text": label[:18], "data": f"m:color:{product_id}:{j}"})
+            if len(color_row) == 2:
+                kb_rows.append(color_row)
+                color_row = []
+        if color_row:
+            kb_rows.append(color_row)
+        kb_rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
+        kb_rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
+        kb_rows.append([{"text": "🏠 Меню", "data": "m:home"}])
+
+        caption = tg_product_caption(product, color=color)
+        if image_url:
+            try:
+                await callback.message.edit_media(
+                    types.InputMediaPhoto(media=image_url, caption=caption, parse_mode="HTML"),
+                    reply_markup=_tg_kb(kb_rows),
+                )
+            except Exception:
+                await callback.message.answer_photo(photo=image_url, caption=caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+        else:
+            await callback.message.edit_text(caption, parse_mode="HTML", reply_markup=_tg_kb(kb_rows))
+        return
+
+    if action == "ask" and len(parts) >= 3:
+        product_id = parts[2]
+        product = await catalog_get_product(product_id)
+        if not product:
+            await callback.message.answer("Товар не найден.")
+            return
+        state = _get_state("tg", str(callback.message.chat.id))
+        state["mode"] = "ask_ai_product"
+        state["product"] = {
+            "id": product.get("id"),
+            "name": product.get("name"),
+            "description": product.get("description"),
+            "colors": product.get("colors", []),
+            "url": product.get("url"),
+        }
+        await callback.message.answer("Напишите вопрос по этому товару — я отвечу с учётом описания и цветов.", reply_markup=tg_kb_main())
+        return
+    if action == "manager":
+        async with async_session() as session:
+            chat = await get_chat_by_uuid(session, str(callback.message.chat.id))
+            if not chat:
+                chat = await create_chat(session, str(callback.message.chat.id), name=callback.from_user.first_name, messager="telegram")
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_created",
+                    "chat": {
+                        "id": chat.id,
+                        "uuid": chat.uuid,
+                        "name": chat.name,
+                        "messager": chat.messager,
+                        "waiting": chat.waiting,
+                        "ai": chat.ai,
+                        "tags": chat.tags,
+                        "last_message_content": None,
+                        "last_message_timestamp": None
+                    }
+                }))
+            await request_manager(session, chat.id, str(callback.message.chat.id), callback.from_user.first_name or str(callback.message.chat.id), "telegram")
+        await callback.message.answer("Я позвал менеджера. Напишите, что нужно — он подключится.", reply_markup=tg_kb_main())
+        return
 
 @dp.callback_query(lambda c: c.data.startswith("notifications_"))
 async def handle_notification_toggle(callback: types.CallbackQuery):
@@ -1128,6 +1956,44 @@ async def handle_message(message: Message):
             }
             await updates_manager.broadcast(json.dumps(new_chat_message))
 
+        text_norm = _normalize(message.text)
+        if text_norm in {"меню", "/menu", "menu"}:
+            await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
+            return
+        if text_norm in {"faq", "/faq"}:
+            await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(), parse_mode="HTML")
+            return
+        if text_norm in {"каталог", "товары", "товар"}:
+            categories = await catalog_get_categories()
+            if not categories:
+                await message.answer("<b>Каталог</b>\n<blockquote>Пока недоступен</blockquote>", parse_mode="HTML", reply_markup=tg_kb_main())
+                return
+            rows: List[List[Dict[str, str]]] = []
+            row: List[Dict[str, str]] = []
+            for c in categories[:12]:
+                cid = str(c.get("id") or c.get("slug") or "")
+                name = str(c.get("name") or "Категория")[:28]
+                if not cid:
+                    continue
+                row.append({"text": name, "data": f"m:cat:{cid}:1"})
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+            rows.append([{"text": "🏠 Меню", "data": "m:home"}])
+            await message.answer("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", parse_mode="HTML", reply_markup=_tg_kb(rows))
+            return
+
+        force_manager = "позови менеджера" in text_norm or text_norm == "менеджер"
+        state = _get_state("tg", str(message.chat.id))
+        ai_question = message.text
+        if state.get("mode") == "ask_ai_product" and state.get("product"):
+            p = state["product"]
+            context = f"Контекст товара:\nНазвание: {p.get('name','')}\nОписание: {p.get('description','')}\nЦвета: {', '.join(p.get('colors', []))}\nСсылка: {p.get('url','')}"
+            ai_question = f"{context}\n\nВопрос пользователя: {message.text}"
+            _clear_state("tg", str(message.chat.id))
+
         new_message = Message(
             chat_id=chat.id,
             message=message.text,
@@ -1149,6 +2015,25 @@ async def handle_message(message: Message):
             "id": new_message.id
         }
         await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        if force_manager:
+            await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+            await update_chat_ai(db=session, chat_id=chat.id, ai=False)
+            await updates_manager.broadcast(json.dumps({
+                "type": "chat_update",
+                "chat_id": chat.id,
+                "waiting": True,
+                "ai": False
+            }))
+            notification_manager = notifications.get_notification_manager()
+            if notification_manager:
+                await notification_manager.send_waiting_notification(
+                    chat_id=message.chat.id,
+                    chat_name=message.chat.first_name or str(message.chat.id),
+                    messager="telegram"
+                )
+            await message.answer("Я позвал менеджера. Напишите, что нужно — он подключится.", reply_markup=tg_kb_main())
+            return
 
         if not chat.ai:
             await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
@@ -1173,7 +2058,7 @@ async def handle_message(message: Message):
             async with current_session.post(
                 API_URL,
                 json={
-                    "question": message.text,
+                    "question": ai_question,
                     "chat_id": chat.id
                 }
             ) as response:
