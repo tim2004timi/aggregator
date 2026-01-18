@@ -612,7 +612,7 @@ def _extract_image_url(obj: Any) -> Optional[str]:
     if isinstance(obj, str) and obj:
         return _catalog_abs_url(obj) if not obj.startswith("http") else obj
     if isinstance(obj, dict):
-        for k in ("url", "image_url", "src", "path", "link"):
+        for k in ("url", "image_url", "src", "path", "link", "file"):
             v = obj.get(k)
             if isinstance(v, str) and v:
                 return _catalog_abs_url(v) if not v.startswith("http") else v
@@ -739,14 +739,16 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
     if not isinstance(items, list):
         return None
 
-    all_products: List[Dict[str, Any]] = []
+    uniq: Dict[str, Dict[str, Any]] = {}
     for raw in items:
         if not isinstance(raw, dict):
             continue
-        pid = raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid")
+        base_pid = raw.get("product_id") or raw.get("base_product_id") or raw.get("baseProductId")
+        looks_like_variant = base_pid is not None and (raw.get("color_id") is not None or raw.get("colorId") is not None or raw.get("label") is not None or raw.get("hex") is not None)
+        pid = base_pid if looks_like_variant else (raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid"))
         if pid is None:
             continue
-        name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or "").strip() or str(pid)
+        name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or raw.get("base_title") or "").strip() or str(pid)
         description = str(raw.get("description") or raw.get("desc") or "").strip()
         url = str(raw.get("url") or raw.get("link") or "").strip()
         price = raw.get("price") or raw.get("cost")
@@ -759,18 +761,21 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
         if not images and isinstance(raw.get("images"), list):
             imgs = [_extract_image_url(x) for x in raw.get("images")]
             images = [x for x in imgs if x]
-        all_products.append({
-            "id": str(pid),
-            "name": name,
-            "description": description,
-            "url": url,
-            "price": price,
-            "images": images,
-            "colors": [],
-            "color_entries": [],
-            "images_by_color": {},
-        })
+        pid_str = str(pid)
+        if pid_str not in uniq:
+            uniq[pid_str] = {
+                "id": pid_str,
+                "name": name,
+                "description": description,
+                "url": url,
+                "price": price,
+                "images": images,
+                "colors": [],
+                "color_entries": [],
+                "images_by_color": {},
+            }
 
+    all_products = list(uniq.values())
     if used_products_endpoint:
         normalized = all_products[:limit]
     else:
@@ -811,7 +816,7 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
             if not isinstance(c, dict):
                 continue
             cid = c.get("id") or c.get("product_color_id") or c.get("color_id")
-            cname = str(c.get("name") or c.get("title") or c.get("color") or c.get("value") or c.get("color_name") or "").strip()
+            cname = str(c.get("label") or c.get("name") or c.get("title") or c.get("color") or c.get("value") or c.get("color_name") or "").strip()
             if cid is None or not cname:
                 continue
             color_entries.append({"id": str(cid), "name": cname})
@@ -2046,51 +2051,59 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         await callback.answer()
         return
     action = parts[1]
-    await callback.answer()
+    async def _edit_or_send(text: str, reply_markup: Optional[types.InlineKeyboardMarkup] = None) -> None:
+        msg = callback.message
+        if not msg:
+            return
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+        except Exception:
+            await msg.answer(text, reply_markup=reply_markup, parse_mode="HTML")
 
-    if action == "home":
-        await callback.message.edit_text(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
-        return
-    if action == "faq":
-        if len(parts) == 2:
-            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
+    try:
+        if action == "home":
+            await _edit_or_send(_tg_main_text(), tg_kb_main())
             return
-        if len(parts) >= 4 and parts[2] == "page" and str(parts[3]).isdigit():
-            page = int(parts[3])
-            await callback.message.edit_text(_tg_faq_text(), reply_markup=tg_kb_faq_menu(page), parse_mode="HTML")
-            return
-        if len(parts) >= 5 and parts[2] == "item":
-            item_id = parts[3]
-            page = int(parts[4]) if str(parts[4]).isdigit() else 1
-            await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id, page), parse_mode="HTML")
-            return
-        item_id = parts[2]
-        await callback.message.edit_text(_tg_faq_item_text(item_id), reply_markup=tg_kb_faq_item(item_id, 1), parse_mode="HTML")
-        return
-    if action == "cat":
-        if len(parts) == 2:
-            categories = await catalog_get_categories()
-            if not categories:
-                reason = str(_catalog_cache.get("last_error") or "").strip()
-                details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пока недоступен</blockquote>"
-                await callback.message.edit_text(f"<b>Каталог</b>{details}", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:home"}]]), parse_mode="HTML")
+        if action == "faq":
+            if len(parts) == 2:
+                await _edit_or_send(_tg_faq_text(), tg_kb_faq_menu(1))
                 return
-            rows: List[List[Dict[str, str]]] = []
-            row: List[Dict[str, str]] = []
-            for c in categories[:12]:
-                cid = str(c.get("slug") or "")
-                name = str(c.get("name") or "Категория")[:28]
-                if not cid:
-                    continue
-                row.append({"text": name, "data": f"m:cat:{cid}:1"})
-                if len(row) == 2:
-                    rows.append(row)
-                    row = []
-            if row:
-                rows.append(row)
-            rows.append([{"text": "⬅️ Назад", "data": "m:home"}])
-            await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", reply_markup=_tg_kb(rows), parse_mode="HTML")
+            if len(parts) >= 4 and parts[2] == "page" and str(parts[3]).isdigit():
+                page = int(parts[3])
+                await _edit_or_send(_tg_faq_text(), tg_kb_faq_menu(page))
+                return
+            if len(parts) >= 5 and parts[2] == "item":
+                item_id = parts[3]
+                page = int(parts[4]) if str(parts[4]).isdigit() else 1
+                await _edit_or_send(_tg_faq_item_text(item_id), tg_kb_faq_item(item_id, page))
+                return
+            item_id = parts[2]
+            await _edit_or_send(_tg_faq_item_text(item_id), tg_kb_faq_item(item_id, 1))
             return
+        if action == "cat":
+            if len(parts) == 2:
+                categories = await catalog_get_categories()
+                if not categories:
+                    reason = str(_catalog_cache.get("last_error") or "").strip()
+                    details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пока недоступен</blockquote>"
+                    await _edit_or_send(f"<b>Каталог</b>{details}", _tg_kb([[{"text": "⬅️ Назад", "data": "m:home"}]]))
+                    return
+                rows: List[List[Dict[str, str]]] = []
+                row: List[Dict[str, str]] = []
+                for c in categories[:12]:
+                    cid = str(c.get("slug") or "")
+                    name = str(c.get("name") or "Категория")[:28]
+                    if not cid:
+                        continue
+                    row.append({"text": name, "data": f"m:cat:{cid}:1"})
+                    if len(row) == 2:
+                        rows.append(row)
+                        row = []
+                if row:
+                    rows.append(row)
+                rows.append([{"text": "⬅️ Назад", "data": "m:home"}])
+                await _edit_or_send("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", _tg_kb(rows))
+                return
 
         category_id = parts[2]
         page = 1
@@ -2127,8 +2140,20 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             rows.append(nav_row)
         rows.append([{"text": "⬅️ Категории", "data": "m:cat"}])
         rows.append([{"text": "🏠 Меню", "data": "m:home"}])
-        await callback.message.edit_text(f"<b>Каталог</b>\n<blockquote>Страница {page}</blockquote>", reply_markup=_tg_kb(rows), parse_mode="HTML")
+        await _edit_or_send(f"<b>Каталог</b>\n<blockquote>Страница {page}</blockquote>", _tg_kb(rows))
         return
+    except Exception:
+        logging.exception("TG callback handler failed: %r", callback.data)
+        if callback.message:
+            try:
+                await callback.message.answer("Что-то пошло не так. Напишите /menu", reply_markup=tg_kb_main())
+            except Exception:
+                pass
+    finally:
+        try:
+            await callback.answer()
+        except Exception:
+            pass
 
     if action == "prod" and len(parts) >= 3:
         product_id = parts[2]
