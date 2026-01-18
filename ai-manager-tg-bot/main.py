@@ -304,11 +304,11 @@ def tg_kb_faq_menu(page: int = 1) -> types.InlineKeyboardMarkup:
 
     buttons: List[List[Dict[str, str]]] = []
     row: List[Dict[str, str]] = []
-    for item_id in FAQ_ORDER[start:end]:
+    for idx, item_id in enumerate(FAQ_ORDER[start:end], start=start):
         title = FAQ_ITEMS.get(item_id, {}).get("title", item_id)
         ru = title.split("(")[-1].rstrip(")") if "(" in title and ")" in title else title
         label = ru[:28]
-        row.append({"text": label, "data": f"m:faq:item:{item_id}:{page}"})
+        row.append({"text": label, "data": f"m:faq:item:{idx}:{page}"})
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -2075,6 +2075,10 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             if len(parts) >= 5 and parts[2] == "item":
                 item_id = parts[3]
                 page = int(parts[4]) if str(parts[4]).isdigit() else 1
+                if str(item_id).isdigit():
+                    idx = int(item_id)
+                    if 0 <= idx < len(FAQ_ORDER):
+                        item_id = FAQ_ORDER[idx]
                 await _edit_or_send(_tg_faq_item_text(item_id), tg_kb_faq_item(item_id, page))
                 return
             item_id = parts[2]
@@ -2104,44 +2108,47 @@ async def handle_menu_callback(callback: types.CallbackQuery):
                 rows.append([{"text": "⬅️ Назад", "data": "m:home"}])
                 await _edit_or_send("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", _tg_kb(rows))
                 return
+            if len(parts) < 3:
+                await _edit_or_send("<b>Каталог</b>\n<blockquote>Не понял категорию</blockquote>", _tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]))
+                return
 
-        category_id = parts[2]
-        page = 1
-        if len(parts) >= 4 and str(parts[3]).isdigit():
-            page = int(parts[3])
-        limit = 8
-        items = await catalog_get_products(category_id, page=page, limit=limit)
-        if not items:
-            reason = str(_catalog_cache.get("last_error") or "").strip()
-            details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пусто или API недоступен</blockquote>"
-            await callback.message.edit_text(f"<b>Каталог</b>{details}", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]), parse_mode="HTML")
-            return
+            category_id = parts[2]
+            page = 1
+            if len(parts) >= 4 and str(parts[3]).isdigit():
+                page = int(parts[3])
+            limit = 8
+            items = await catalog_get_products(category_id, page=page, limit=limit)
+            if not items:
+                reason = str(_catalog_cache.get("last_error") or "").strip()
+                details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пусто или API недоступен</blockquote>"
+                await _edit_or_send(f"<b>Каталог</b>{details}", _tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]))
+                return
 
-        state = _get_state("tg", str(callback.message.chat.id))
-        state["last_category"] = category_id
-        state["last_page"] = page
+            state = _get_state("tg", str(callback.message.chat.id))
+            state["last_category"] = category_id
+            state["last_page"] = page
 
-        rows: List[List[Dict[str, str]]] = []
-        row: List[Dict[str, str]] = []
-        for p in items:
-            row.append({"text": str(p.get("name") or "Товар")[:28], "data": f"m:prod:{p['id']}"})
-            if len(row) == 2:
+            rows: List[List[Dict[str, str]]] = []
+            row: List[Dict[str, str]] = []
+            for p in items:
+                row.append({"text": str(p.get("name") or "Товар")[:28], "data": f"m:prod:{p['id']}"})
+                if len(row) == 2:
+                    rows.append(row)
+                    row = []
+            if row:
                 rows.append(row)
-                row = []
-        if row:
-            rows.append(row)
 
-        nav_row: List[Dict[str, str]] = []
-        if page > 1:
-            nav_row.append({"text": "⬅️", "data": f"m:cat:{category_id}:{page-1}"})
-        if len(items) >= limit:
-            nav_row.append({"text": "➡️", "data": f"m:cat:{category_id}:{page+1}"})
-        if nav_row:
-            rows.append(nav_row)
-        rows.append([{"text": "⬅️ Категории", "data": "m:cat"}])
-        rows.append([{"text": "🏠 Меню", "data": "m:home"}])
-        await _edit_or_send(f"<b>Каталог</b>\n<blockquote>Страница {page}</blockquote>", _tg_kb(rows))
-        return
+            nav_row: List[Dict[str, str]] = []
+            if page > 1:
+                nav_row.append({"text": "⬅️", "data": f"m:cat:{category_id}:{page-1}"})
+            if len(items) >= limit:
+                nav_row.append({"text": "➡️", "data": f"m:cat:{category_id}:{page+1}"})
+            if nav_row:
+                rows.append(nav_row)
+            rows.append([{"text": "⬅️ Категории", "data": "m:cat"}])
+            rows.append([{"text": "🏠 Меню", "data": "m:home"}])
+            await _edit_or_send(f"<b>Каталог</b>\n<blockquote>Страница {page}</blockquote>", _tg_kb(rows))
+            return
     except Exception:
         logging.exception("TG callback handler failed: %r", callback.data)
         if callback.message:
