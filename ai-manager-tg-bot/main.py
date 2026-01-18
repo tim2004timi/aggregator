@@ -53,10 +53,74 @@ FAQ_ORDER: List[str] = []
 TG_FAQ_PAGE_SIZE = 12
 VK_FAQ_PAGE_SIZE = 10
 
+FAQ_INLINE_RAW = """
+Q: Delivery Time? (Когда ожидать доставку?)
+A: **Срок зависит** от того, в наличии ли вещь или на предзаказе. Если в наличии — отправка на следующий день. Если предзаказ — сроки производства и отправки устанавливаются брендом. **Точные сроки** по предзаказу подскажет менеджер. Хотите, чтобы я связал вас с ним?
+
+Q: Tell me the status of order XXXXX (Подскажи статус заказа XXXXX?)
+A: В данный момент я не могу называть статусы заказов, но могу перевести вас на менеджера. Подключить вас?
+
+Q: What is Pre-order? (Что такое предзаказ?)
+A: Предзаказ — это резервирование вещи до ее производства. Вы заранее предоставляете средства на пошив и получаете товар одним из первых.
+
+Q: How long is Pre-order? (Как долго ожидать вещи с предзаказа?)
+A: Обычно от 2 до 4 недель, но срок может сдвигаться. Лучше уточните у менеджера — хотите, чтобы я вас с ним связал?
+
+Q: Return Policy? (Как отменить/вернуть заказ?)
+A: Возврат согласуется с менеджером. Товар должен быть надлежащего качества и возвратным. Возврат платный (по тарифу доставки). В посылке должно быть заявление (бланк у менеджера). **Отмена заказа** возможна только в первые 30 минут после оформления.
+
+Q: Size Guide? (Где находится таблица размеров?)
+A: Таблицы размещены на сайте — в описании товара или на изображениях. Если её нет — значит таблицы для этой вещи не существует. Можно уточнить у менеджера.
+
+Q: Why is shipping delayed? (Почему отправка так затянулась?)
+A: Скорее всего, вы заказали товар на предзаказе, либо заказ в статусе «на утверждении».
+
+Q: Is it a Pre-order? (Как определить, на предзаказе ли вещь?)
+A: Если перед названием товара на сайте стоит «+» — вещь в наличии. Если нет знака — это предзаказ. Можно уточнить у менеджера. Хотите, свяжу вас с менеджером?
+
+Q: What if my order has both pre-order and in-stock items? (Когда будет отправка, если в заказе и то и другое?)
+A: Заказ отправляется, когда все позиции готовы. Но можно разделить заказ — вас связать с менеджером?
+
+Q: International Shipping? (Доставляете ли вы вещи за границы РФ?)
+A: Да, доставляем. Для оформления вам нужно связаться с менеджером. Перевести вас на менеджера?
+
+Q: Which carriers do you use? (Какими службами доставки отправляете?)
+A: Почта России и СДЭК.
+
+Q: How do I choose a size? (Как подобрать размер?)
+A: Ориентируйтесь на таблицу размеров на странице товара. Если таблицы нет — уточните у менеджера, он подскажет по меркам.
+
+Q: Which items are non-returnable? (Какие товары не подлежат возврату?)
+A: Бельевые изделия (швейные и трикотажные) и чулочно-носочные изделия (согласно Пост. Правительства РФ №55).
+
+Q: How should I care for PSIH items? (Как ухаживать за вещами PSIH?)
+A: Ручная или деликатная стирка 15–30°С, вывернуть наизнанку, без отбеливателя. Кастом — стирать отдельно, места с росписью не тереть, сушить горизонтально, без прямого солнца. Гладить щадяще с изнанки; рисунок — только через ткань; без отпаривателя.
+
+Q: What if my item is defective? (Что делать, если брак?)
+A: Брак подтверждается экспертизой; при подтверждении возможен возврат/обмен. Продавец может согласовать возврат/обмен без экспертизы — по ситуации.
+
+--- Brand Information & Details ---
+🧠 **Общая информация о бренде ПСИХ**
+• **Название:** ПСИХ (PSIH)
+• **Официальный сайт:** https://psihclothes.com/
+• **VK:** https://vk.com/psihclothes
+
+🎭 **Концепция и философия бренда**
+ПСИХ — это не просто одежда, это способ самовыражения, отражающий внутренние переживания и эмоции.
+
+🛍️ **Покупка и доставка**
+Оформление заказов: через сайт psihclothes.com. Доставка: по России и в другие страны.
+--- End Brand Information & Details ---
+""".strip()
+
 CATALOG_API_URL = os.getenv("CATALOG_API_URL")
 CATALOG_AUTH_TOKEN = os.getenv("CATALOG_AUTH_TOKEN")
+CATALOG_AUTH_USERNAME = os.getenv("CATALOG_AUTH_USERNAME") or os.getenv("CATALOG_USERNAME") or os.getenv("CATALOG_USER")
+CATALOG_AUTH_PASSWORD = os.getenv("CATALOG_AUTH_PASSWORD") or os.getenv("CATALOG_PASSWORD") or os.getenv("CATALOG_PASS")
+CATALOG_TOKEN_TTL_SECONDS = int(os.getenv("CATALOG_TOKEN_TTL_SECONDS", "3300"))
 CATALOG_CACHE_TTL_SECONDS = int(os.getenv("CATALOG_CACHE_TTL_SECONDS", "60"))
 _catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}, "color_images": {}}
+_catalog_token_cache: Dict[str, Any] = {"ts": 0.0, "token": None}
 
 _user_state: Dict[str, Dict[str, Any]] = {}
 
@@ -149,11 +213,12 @@ def _parse_faq_markdown(raw: str) -> Dict[str, Dict[str, str]]:
 def load_faq() -> None:
     global FAQ_ITEMS, FAQ_ORDER
     p = _find_faq_file()
-    if not p:
-        FAQ_ITEMS = {}
-        FAQ_ORDER = []
-        return
-    raw = p.read_text(encoding="utf-8", errors="ignore")
+    faq_mode = str(os.getenv("FAQ_MODE") or "inline").strip().lower()
+    raw = None
+    if faq_mode == "file" and p:
+        raw = p.read_text(encoding="utf-8", errors="ignore")
+    if raw is None:
+        raw = FAQ_INLINE_RAW
     items = _parse_faq_markdown(raw)
     preferred_order = [
         "delivery_time",
@@ -182,6 +247,8 @@ def load_faq() -> None:
             ordered.append(key)
     FAQ_ITEMS = items
     FAQ_ORDER = ordered
+    src = str(p) if (faq_mode == "file" and p) else "inline"
+    logging.info("FAQ loaded: %s items from %s", len(FAQ_ITEMS), src)
 
 def ensure_faq_loaded() -> None:
     if not FAQ_ITEMS:
@@ -196,6 +263,9 @@ def _tg_main_text() -> str:
     return "<b>PSIH</b>\n<blockquote>Выберите раздел ниже или просто напишите вопрос</blockquote>"
 
 def _tg_faq_text() -> str:
+    ensure_faq_loaded()
+    if not FAQ_ORDER:
+        return "<b>FAQ</b>\n<blockquote>Пока пусто: раздел ещё не настроен</blockquote>"
     return "<b>FAQ</b>\n<blockquote>Выберите тему</blockquote>"
 
 def _tg_faq_item_text(item_id: str) -> str:
@@ -268,6 +338,9 @@ def _vk_main_text() -> str:
     return "PSIH\n\nВыберите раздел ниже или просто напишите вопрос."
 
 def _vk_faq_text() -> str:
+    ensure_faq_loaded()
+    if not FAQ_ORDER:
+        return "FAQ\n\nПока пусто: раздел ещё не настроен"
     return "FAQ\n\nВыберите тему:"
 
 def _vk_faq_item_text(item_id: str) -> str:
@@ -276,7 +349,7 @@ def _vk_faq_item_text(item_id: str) -> str:
     if not item:
         return "FAQ\n\nТема не найдена."
     title = item["title"]
-    answer = item["answer"]
+    answer = re.sub(r"\*\*(.+?)\*\*", r"\1", item["answer"])
     return f"{title}\n\n«{answer}»"
 
 def vk_kb_main() -> Optional[str]:
@@ -452,21 +525,80 @@ async def request_manager(db: AsyncSession, chat_id: int, peer_id: str, chat_nam
 def _catalog_is_fresh(ts: float) -> bool:
     return (datetime.utcnow().timestamp() - ts) < CATALOG_CACHE_TTL_SECONDS
 
+def _catalog_token_is_fresh(ts: float) -> bool:
+    return (datetime.utcnow().timestamp() - ts) < CATALOG_TOKEN_TTL_SECONDS
+
+async def _catalog_get_token() -> Optional[str]:
+    base = (CATALOG_API_URL or "").rstrip("/")
+    if not base or not CATALOG_AUTH_USERNAME or not CATALOG_AUTH_PASSWORD:
+        return None
+
+    cached = _catalog_token_cache.get("token")
+    if cached and _catalog_token_is_fresh(float(_catalog_token_cache.get("ts") or 0.0)):
+        return str(cached)
+
+    url = f"{base}/api/auth/token"
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.post(
+            url,
+            data={"username": CATALOG_AUTH_USERNAME, "password": CATALOG_AUTH_PASSWORD},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            content_type = resp.headers.get("content-type", "")
+            if resp.status != 200:
+                text = await resp.text()
+                _catalog_cache["last_error"] = f"{resp.status} от /api/auth/token: {text[:200]}"
+                return None
+            if "application/json" in content_type:
+                data = await resp.json()
+            else:
+                text = await resp.text()
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+            if not isinstance(data, dict):
+                _catalog_cache["last_error"] = "Неожиданный ответ /api/auth/token"
+                return None
+            token = data.get("access_token") or data.get("token")
+            if not token:
+                _catalog_cache["last_error"] = "Токен не найден в ответе /api/auth/token"
+                return None
+            _catalog_token_cache["token"] = str(token)
+            _catalog_token_cache["ts"] = datetime.utcnow().timestamp()
+            return str(token)
+    except Exception:
+        _catalog_cache["last_error"] = "Ошибка запроса /api/auth/token"
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
 async def _catalog_get_json(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
     base = (CATALOG_API_URL or "").rstrip("/")
     if not base:
+        _catalog_cache["last_error"] = "CATALOG_API_URL не задан"
         return None
     url = f"{base}{path}"
     headers: Dict[str, str] = {}
-    if CATALOG_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {CATALOG_AUTH_TOKEN}"
+    token = CATALOG_AUTH_TOKEN
+    if not token and CATALOG_AUTH_USERNAME and CATALOG_AUTH_PASSWORD:
+        token = await _catalog_get_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
     try:
         async with current_session.get(url, params=params, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
             if resp.status != 200:
+                text = await resp.text()
+                _catalog_cache["last_error"] = f"{resp.status} от {path}: {text[:200]}"
                 return None
+            _catalog_cache["last_error"] = None
             return await resp.json()
     except Exception:
+        _catalog_cache["last_error"] = f"Ошибка запроса {path}"
         return None
     finally:
         if current_session != http_session:
@@ -578,7 +710,24 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
     if cached and _catalog_is_fresh(cached["ts"]):
         return cached["data"]
 
-    data = await _catalog_get_json("/api/products", params={"category": category_id, "page": page, "limit": limit})
+    offset = max(0, (int(page or 1) - 1) * int(limit or 0))
+    params_variants: List[Dict[str, Any]] = [
+        {"category": category_id, "page": page, "limit": limit},
+        {"category_slug": category_id, "page": page, "limit": limit},
+        {"categorySlug": category_id, "page": page, "limit": limit},
+        {"category": category_id, "offset": offset, "limit": limit},
+        {"category_slug": category_id, "offset": offset, "limit": limit},
+        {"category": category_id, "skip": offset, "limit": limit},
+        {"category_slug": category_id, "skip": offset, "limit": limit},
+        {"category": category_id, "page": page, "size": limit},
+        {"category_slug": category_id, "page": page, "size": limit},
+    ]
+    data: Any = None
+    for params in params_variants:
+        data = await _catalog_get_json("/api/products", params=params)
+        if data is not None:
+            break
+
     used_products_endpoint = data is not None
     if data is None:
         data = await _catalog_get_json(f"/api/categories/{category_id}")
@@ -635,6 +784,8 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
     if cached and _catalog_is_fresh(cached["ts"]):
         return cached["data"]
     base = await _catalog_get_json(f"/api/products/{product_id}")
+    if base is None:
+        base = await _catalog_get_json(f"/api/products/slug/{product_id}")
     if not isinstance(base, dict):
         return None
     pid = base.get("id") or base.get("product_id") or base.get("uuid") or product_id
@@ -845,7 +996,11 @@ async def handle_single_event(event):
             if cmd == "cat":
                 categories = await catalog_get_categories()
                 if not categories:
-                    await vk_send_message(peer_id, "Каталог пока недоступен.", keyboard=vk_kb_main())
+                    reason = str(_catalog_cache.get("last_error") or "").strip()
+                    text_out = "Каталог пока недоступен."
+                    if reason:
+                        text_out += f"\nПричина: {reason}"
+                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                     return
                 await vk_send_message(peer_id, "Каталог\n\nВыберите категорию:", keyboard=vk_kb_categories(categories))
                 return
@@ -855,7 +1010,11 @@ async def handle_single_event(event):
                 limit = 6
                 items = await catalog_get_products(category_id, page=page, limit=limit)
                 if not items:
-                    await vk_send_message(peer_id, "Каталог пустой или API недоступен.", keyboard=vk_kb_main())
+                    reason = str(_catalog_cache.get("last_error") or "").strip()
+                    text_out = "Каталог пустой или API недоступен."
+                    if reason:
+                        text_out += f"\nПричина: {reason}"
+                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                     return
                 await vk_send_message(peer_id, f"Каталог\n\nСтраница {page}", keyboard=vk_kb_products(category_id, page, items, has_next=len(items) >= limit))
                 return
@@ -938,12 +1097,16 @@ async def handle_single_event(event):
             await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
             return
         if text_norm in {"faq", "/faq"}:
-            await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu())
+            await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(1))
             return
         if text_norm in {"каталог", "товары", "товар"}:
             categories = await catalog_get_categories()
             if not categories:
-                await vk_send_message(peer_id, "Каталог пока недоступен.", keyboard=vk_kb_main())
+                reason = str(_catalog_cache.get("last_error") or "").strip()
+                text_out = "Каталог пока недоступен."
+                if reason:
+                    text_out += f"\nПричина: {reason}"
+                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                 return
             await vk_send_message(peer_id, "Каталог\n\nВыберите категорию:", keyboard=vk_kb_categories(categories))
             return
@@ -1908,7 +2071,9 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         if len(parts) == 2:
             categories = await catalog_get_categories()
             if not categories:
-                await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Пока недоступен</blockquote>", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:home"}]]), parse_mode="HTML")
+                reason = str(_catalog_cache.get("last_error") or "").strip()
+                details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пока недоступен</blockquote>"
+                await callback.message.edit_text(f"<b>Каталог</b>{details}", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:home"}]]), parse_mode="HTML")
                 return
             rows: List[List[Dict[str, str]]] = []
             row: List[Dict[str, str]] = []
@@ -1934,7 +2099,9 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         limit = 8
         items = await catalog_get_products(category_id, page=page, limit=limit)
         if not items:
-            await callback.message.edit_text("<b>Каталог</b>\n<blockquote>Пусто или API недоступен</blockquote>", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]), parse_mode="HTML")
+            reason = str(_catalog_cache.get("last_error") or "").strip()
+            details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пусто или API недоступен</blockquote>"
+            await callback.message.edit_text(f"<b>Каталог</b>{details}", reply_markup=_tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]), parse_mode="HTML")
             return
 
         state = _get_state("tg", str(callback.message.chat.id))
