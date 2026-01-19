@@ -991,6 +991,8 @@ def start_poller(loop: asyncio.AbstractEventLoop):
             logging.info("🟢 VK bot started polling")
             for event in longpoll.listen():
                 etype = getattr(event, "type", None)
+                if etype is None and isinstance(event, dict):
+                    etype = event.get("type")
                 logging.info(f"🟢 VK event received: {etype}")
                 # передаём событие в цикл
                 loop.call_soon_threadsafe(queue.put_nowait, event)
@@ -1011,11 +1013,15 @@ async def handle_events():
 
 async def handle_single_event(event):
     etype = getattr(event, "type", None)
+    if etype is None and isinstance(event, dict):
+        etype = event.get("type")
     etype_str = str(etype).lower()
     if not (etype == VkBotEventType.MESSAGE_NEW or "message_new" in etype_str):
         return
 
     payload_obj = getattr(event, "object", None)
+    if payload_obj is None and isinstance(event, dict):
+        payload_obj = event.get("object") or event.get("message") or event
     if isinstance(payload_obj, dict):
         msg = payload_obj.get("message") or payload_obj.get("object") or payload_obj
     else:
