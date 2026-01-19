@@ -80,7 +80,7 @@ const ChatStats = () => {
             <Button
               variant="outline"
               size="icon"
-              onClick={() => navigate('/ai-chats')}
+              onClick={() => navigate(location.pathname === '/ai-chats' ? '/' : '/ai-chats')}
               className={`w-10 h-10 border-gray-300 hover:bg-gray-100 mr-2 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
             >
               <Bot size={20} />

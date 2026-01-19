@@ -958,6 +958,11 @@ if VK_GROUP_ID_RAW:
         VK_GROUP_ID = int(VK_GROUP_ID_RAW)
     except ValueError:
         logging.error("Invalid VK_GROUP_ID=%r (expected integer). VK integration will be disabled.", VK_GROUP_ID_RAW)
+else:
+    logging.warning("VK_GROUP_ID is not set. VK integration will be disabled.")
+
+if not VK_TOKEN:
+    logging.warning("VK_TOKEN is not set. VK integration will be disabled.")
 
 # Синхронные объекты vk_api (инициализируем только если есть корректная конфигурация)
 vk_session = None
@@ -985,7 +990,8 @@ def start_poller(loop: asyncio.AbstractEventLoop):
         try:
             logging.info("🟢 VK bot started polling")
             for event in longpoll.listen():
-                logging.info(f"🟢 VK event received: {event.type}")
+                etype = getattr(event, "type", None)
+                logging.info(f"🟢 VK event received: {etype}")
                 # передаём событие в цикл
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as e:
@@ -1004,10 +1010,18 @@ async def handle_events():
         asyncio.create_task(handle_single_event(event))
 
 async def handle_single_event(event):
-    if event.type != VkBotEventType.MESSAGE_NEW:
+    etype = getattr(event, "type", None)
+    etype_str = str(etype).lower()
+    if not (etype == VkBotEventType.MESSAGE_NEW or "message_new" in etype_str):
         return
 
-    msg = event.object['message']
+    payload_obj = getattr(event, "object", None)
+    if isinstance(payload_obj, dict):
+        msg = payload_obj.get("message") or payload_obj.get("object") or payload_obj
+    else:
+        msg = getattr(payload_obj, "message", None) or payload_obj
+    if not isinstance(msg, dict):
+        return
     peer_id = msg['peer_id']
     user_id = msg['from_id']
     text = msg.get('text', "")

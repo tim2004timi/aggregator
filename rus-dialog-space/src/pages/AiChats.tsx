@@ -1,6 +1,5 @@
 import { useMemo } from 'react';
 import { ArrowLeft, Bot } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
 import { Button } from '@/components/ui/button';
 import ChatSidebar from '@/components/ChatSidebar';
 import ChatView from '@/components/ChatView';
@@ -8,7 +7,6 @@ import ChatStats from '@/components/ChatStats';
 import { useChat } from '@/contexts/ChatContext';
 
 const AiChats = () => {
-  const navigate = useNavigate();
   const { selectedChat, selectChat, chats } = useChat();
 
   const validChatIds = useMemo(() => {
@@ -46,14 +44,6 @@ const AiChats = () => {
               <Bot size={18} className="text-aiHighlight" />
               ИИ чаты
             </div>
-            <Button
-              variant="outline"
-              size="sm"
-              className="ml-auto"
-              onClick={() => navigate('/')}
-            >
-              Все чаты
-            </Button>
           </div>
           <div className="flex-1 overflow-hidden">
             <ChatSidebar onSelectChat={selectChat} validChatIds={validChatIds} />
