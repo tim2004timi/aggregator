@@ -10,6 +10,7 @@ import Index from "./pages/Index";
 import NotFound from "./pages/NotFound";
 import MessageBox from "./pages/MessageBox";
 import Login from "./pages/Login";
+import AiChats from "./pages/AiChats";
 
 console.log('App module loaded');
 
@@ -98,6 +99,7 @@ const App = () => {
             <BrowserRouter>
               <Routes>
                 <Route path="/" element={<RequireAuth><Index /></RequireAuth>} />
+                <Route path="/ai-chats" element={<RequireAuth><AiChats /></RequireAuth>} />
                 <Route path="/login" element={<RedirectIfAuthed><Login /></RedirectIfAuthed>} />
                 <Route path="/message-box" element={<RequireAuth><MessageBox /></RequireAuth>} />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}

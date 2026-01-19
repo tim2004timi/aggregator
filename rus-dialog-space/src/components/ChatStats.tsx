@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { getChatStats } from '@/lib/api';
-import { MessageSquare, Send, CircleDot, Settings } from 'lucide-react';
+import { MessageSquare, CircleDot, Settings, Bot } from 'lucide-react';
 import { useWebSocket } from '@/contexts/WebSocketContext';
 import { Button } from '@/components/ui/button';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 
 const ChatStats = () => {
   const [stats, setStats] = useState({
@@ -14,6 +14,7 @@ const ChatStats = () => {
   const [loading, setLoading] = useState(true);
   const { lastMessage, lastUpdate } = useWebSocket();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const fetchStats = async () => {
     try {
@@ -76,6 +77,14 @@ const ChatStats = () => {
             </div>
           </div>
           <div className="ml-auto">
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => navigate('/ai-chats')}
+              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 mr-2 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
+            >
+              <Bot size={20} />
+            </Button>
             <Button
               variant="outline"
               size="icon"
