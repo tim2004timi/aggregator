@@ -448,13 +448,17 @@ def vk_kb_product(product_id: str, category_id: Optional[str] = None, page: Opti
 
 async def vk_send_message(peer_id: int, message: str, keyboard: Optional[str] = None, attachment: Optional[str] = None) -> None:
     if not vk:
+        logging.warning("VK send skipped: VK is not initialized (check VK_TOKEN/VK_GROUP_ID).")
         return
     payload: Dict[str, Any] = {"peer_id": peer_id, "message": message, "random_id": 0}
     if keyboard:
         payload["keyboard"] = keyboard
     if attachment:
         payload["attachment"] = attachment
-    await asyncio.to_thread(vk.messages.send, **payload)
+    try:
+        await asyncio.to_thread(vk.messages.send, **payload)
+    except Exception as e:
+        logging.error("VK send failed: %s", str(e))
 
 _vk_photo_cache: Dict[str, Dict[str, Any]] = {}
 
