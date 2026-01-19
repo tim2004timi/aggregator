@@ -79,13 +79,11 @@ const ChatStats = () => {
           <div className="ml-auto">
             <Button
               variant="outline"
+              size="icon"
               onClick={() => navigate(location.pathname === '/ai-chats' ? '/' : '/ai-chats')}
-              className={`border-gray-300 hover:bg-gray-100 mr-2 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
+              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 mr-2 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
             >
-              <Bot size={18} className="md:mr-2" />
-              <span className="hidden md:inline">
-                {location.pathname === '/ai-chats' ? 'Все чаты' : 'ИИ чаты'}
-              </span>
+              <Bot size={20} />
             </Button>
             <Button
               variant="outline"
