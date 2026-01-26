@@ -1,4 +1,5 @@
 import asyncio
+import difflib
 import logging
 from aiogram import Dispatcher, types
 from aiogram.filters import Command
@@ -19,14 +20,15 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
-from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag, sync_vk
+from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag, sync_vk, get_ai_settings, upsert_ai_settings, get_ai_knowledge, save_ai_knowledge, assign_chat_to_manager, close_chat_dialog, create_dialog_analytics, get_dialog_analytics, get_all_analytics, get_analytics_stats, DialogAnalytics
 import requests
 from pydantic import BaseModel, validator
 from shared import get_bot
 import json
 from contextlib import asynccontextmanager
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
+from decimal import Decimal
 from sqlalchemy import select, insert
 from crud import Message
 import crud
@@ -52,6 +54,32 @@ FAQ_ITEMS: Dict[str, Dict[str, str]] = {}
 FAQ_ORDER: List[str] = []
 TG_FAQ_PAGE_SIZE = 12
 VK_FAQ_PAGE_SIZE = 10
+
+# OpenAI configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
+
+AI_TOP_K = int(os.getenv("AI_TOP_K", "6"))
+AI_MAX_PRODUCTS = int(os.getenv("AI_MAX_PRODUCTS", "300"))
+AI_PRODUCTS_PAGE = int(os.getenv("AI_PRODUCTS_PAGE", "50"))
+AI_SETTINGS_TTL_SECONDS = int(os.getenv("AI_SETTINGS_TTL_SECONDS", "30"))
+AI_KNOWLEDGE_TTL_SECONDS = int(os.getenv("AI_KNOWLEDGE_TTL_SECONDS", "300"))
+
+DEFAULT_AI_SETTINGS = {
+    "system_message": "Ты — первый менеджер бренда. Отвечай только по фактам из предоставленного контекста и данных сайта.",
+    "faqs": "",
+    "rules": "Если информации нет в контексте или вопрос про заказы/трек — передай менеджеру. Не выдумывай.",
+    "tone": "дружелюбный, мягкий, лаконичный",
+    "handoff_phrases": "хочу человека\nменеджер\nоператор\nне бот\nживой\nсвяжи с человеком",
+    "min_score": 0.2,
+    "site_pages": "",
+    "auto_refresh_minutes": 10,
+}
+
+AI_SETTINGS_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
+AI_KNOWLEDGE_CACHE: Dict[str, Any] = {"data": [], "tokens": [], "ts": 0.0}
+AI_STATUS: Dict[str, Any] = {"last_indexed": None, "last_error": None, "chunks": 0}
 
 FAQ_INLINE_RAW = """
 Q: Delivery Time? (Когда ожидать доставку?)
@@ -119,7 +147,7 @@ CATALOG_AUTH_USERNAME = os.getenv("CATALOG_AUTH_USERNAME") or os.getenv("CATALOG
 CATALOG_AUTH_PASSWORD = os.getenv("CATALOG_AUTH_PASSWORD") or os.getenv("CATALOG_PASSWORD") or os.getenv("CATALOG_PASS")
 CATALOG_TOKEN_TTL_SECONDS = int(os.getenv("CATALOG_TOKEN_TTL_SECONDS", "3300"))
 CATALOG_CACHE_TTL_SECONDS = int(os.getenv("CATALOG_CACHE_TTL_SECONDS", "60"))
-_catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}, "color_images": {}}
+_catalog_cache: Dict[str, Any] = {"ts": 0.0, "categories": None, "products": {}, "product": {}, "product_variants": {}, "color_images": {}}
 _catalog_token_cache: Dict[str, Any] = {"ts": 0.0, "token": None}
 
 _user_state: Dict[str, Dict[str, Any]] = {}
@@ -135,6 +163,34 @@ def _clear_state(platform: str, peer_id: str) -> None:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+def _format_price(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, int):
+        return str(value)
+    try:
+        dec_value = Decimal(str(value))
+    except Exception:
+        return str(value)
+    if dec_value == dec_value.to_integral():
+        return str(dec_value.quantize(Decimal("1")))
+    text = format(dec_value.normalize(), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text
+
+def _normalize_price_text(text: str) -> str:
+    if not text:
+        return text
+    def _repl(match: re.Match) -> str:
+        whole = match.group(0)
+        int_part = match.group(1)
+        frac = match.group(2) or ""
+        if frac == "00":
+            return int_part
+        return whole.replace(",", ".")
+    return re.sub(r"\b(\d+)(?:[.,](\d{2}))\b", _repl, text)
 
 def _faq_slug(text: str) -> str:
     base = _normalize(text)
@@ -262,11 +318,19 @@ def _tg_to_html(text: str) -> str:
 def _tg_main_text() -> str:
     return "<b>PSIH</b>\n<blockquote>Выберите раздел ниже или просто напишите вопрос</blockquote>"
 
-def _tg_faq_text() -> str:
+def _tg_faq_text(page: int = 1) -> str:
     ensure_faq_loaded()
     if not FAQ_ORDER:
         return "<b>FAQ</b>\n<blockquote>Пока пусто: раздел ещё не настроен</blockquote>"
-    return "<b>FAQ</b>\n<blockquote>Выберите тему</blockquote>"
+    total = len(FAQ_ORDER)
+    page_size = TG_FAQ_PAGE_SIZE
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    return (
+        "<b>FAQ</b>\n"
+        f"<blockquote>Тем: {total}. Страница {page}/{total_pages}.\n"
+        "Выберите тему ниже.</blockquote>"
+    )
 
 def _tg_faq_item_text(item_id: str) -> str:
     ensure_faq_loaded()
@@ -337,11 +401,15 @@ def tg_kb_faq_item(item_id: str, page: int = 1) -> types.InlineKeyboardMarkup:
 def _vk_main_text() -> str:
     return "PSIH\n\nВыберите раздел ниже или просто напишите вопрос."
 
-def _vk_faq_text() -> str:
+def _vk_faq_text(page: int = 1) -> str:
     ensure_faq_loaded()
     if not FAQ_ORDER:
         return "FAQ\n\nПока пусто: раздел ещё не настроен"
-    return "FAQ\n\nВыберите тему:"
+    total = len(FAQ_ORDER)
+    page_size = VK_FAQ_PAGE_SIZE
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(int(page or 1), total_pages))
+    return f"FAQ\n\nТем: {total}. Страница {page}/{total_pages}.\nВыберите тему:"
 
 def _vk_faq_item_text(item_id: str) -> str:
     ensure_faq_loaded()
@@ -436,8 +504,6 @@ def vk_kb_product(product_id: str, category_id: Optional[str] = None, page: Opti
             kb.add_line()
     kb.add_button("🧠 Спросить ИИ", color=VkKeyboardColor.PRIMARY, payload={"cmd": "ask_ai", "id": product_id})
     kb.add_line()
-    kb.add_button("👤 Менеджер", color=VkKeyboardColor.NEGATIVE, payload={"cmd": "manager"})
-    kb.add_line()
     if category_id and page:
         kb.add_button("⬅️ Назад", color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": category_id, "page": page})
     else:
@@ -458,7 +524,12 @@ async def vk_send_message(peer_id: int, message: str, keyboard: Optional[str] = 
     try:
         await asyncio.to_thread(vk.messages.send, **payload)
     except Exception as e:
-        logging.error("VK send failed: %s", str(e))
+        error_msg = str(e)
+        if "912" in error_msg or "chat bot feature" in error_msg.lower():
+            logging.error("❌ VK send failed: Необходимо включить 'Возможности ботов' в настройках сообщества VK!")
+            logging.error("   Инструкция: Настройки → Сообщения → Настройки для бота → Включить 'Возможности ботов'")
+        else:
+            logging.error("❌ VK send failed: %s", error_msg)
 
 _vk_photo_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -662,10 +733,34 @@ def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
     pid = raw.get("id") or raw.get("product_id") or raw.get("uuid") or raw.get("slug")
     if pid is None:
         return None
-    name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or "").strip() or str(pid)
+    slug = str(raw.get("slug") or raw.get("product_slug") or raw.get("base_slug") or "").strip()
+    name = str(
+        raw.get("name") or raw.get("title") or raw.get("product_name") or
+        raw.get("base_title") or raw.get("productName") or raw.get("label") or
+        raw.get("display_name") or raw.get("displayName") or ""
+    ).strip()
+    if not name or name.isdigit():
+        name = slug if slug and not slug.isdigit() else ""
+    if not name:
+        name = f"Товар {pid}"
     description = str(raw.get("description") or raw.get("desc") or "").strip()
     url = str(raw.get("url") or raw.get("link") or "").strip()
     price = raw.get("price") or raw.get("cost")
+    base_id = raw.get("product_id") or raw.get("base_product_id") or raw.get("baseProductId")
+    main_category = raw.get("main_category") if isinstance(raw.get("main_category"), dict) else {}
+    category_names: List[str] = []
+    main_name = str(main_category.get("name") or "").strip()
+    if main_name:
+        category_names.append(main_name)
+    category_path = raw.get("categoryPath")
+    if isinstance(category_path, list):
+        for it in category_path:
+            if isinstance(it, dict):
+                cname = str(it.get("name") or it.get("title") or "").strip()
+            else:
+                cname = str(it).strip()
+            if cname:
+                category_names.append(cname)
 
     images: List[str] = []
     if isinstance(raw.get("images"), list):
@@ -699,42 +794,54 @@ def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
 
     return {
         "id": str(pid),
+        "base_id": str(base_id) if base_id is not None else None,
         "name": name,
+        "slug": slug,
         "description": description,
         "url": url,
         "price": price,
         "images": images,
         "colors": colors,
         "images_by_color": images_by_color,
+        "categories": category_names,
     }
 
-async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) -> Optional[List[Dict[str, Any]]]:
-    key = f"{category_id}:{page}:{limit}"
-    cached = _catalog_cache["products"].get(key)
-    if cached and _catalog_is_fresh(cached["ts"]):
-        return cached["data"]
+async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) -> Optional[Dict[str, Any]]:
+    page = max(1, int(page or 1))
+    limit = max(1, int(limit or 8))
+    
+    # Проверяем кеш всех товаров категории для локальной пагинации
+    all_key = f"{category_id}:all"
+    cached_all = _catalog_cache["products"].get(all_key)
+    if cached_all and _catalog_is_fresh(cached_all["ts"]):
+        all_products = cached_all["data"]
+        start = (page - 1) * limit
+        normalized = all_products[start:start + limit]
+        has_next = (start + limit) < len(all_products)
+        return {"items": normalized, "has_next": has_next}
 
-    offset = max(0, (int(page or 1) - 1) * int(limit or 0))
-    params_variants: List[Dict[str, Any]] = [
-        {"category": category_id, "page": page, "limit": limit},
-        {"category_slug": category_id, "page": page, "limit": limit},
-        {"categorySlug": category_id, "page": page, "limit": limit},
-        {"category": category_id, "offset": offset, "limit": limit},
-        {"category_slug": category_id, "offset": offset, "limit": limit},
-        {"category": category_id, "skip": offset, "limit": limit},
-        {"category_slug": category_id, "skip": offset, "limit": limit},
-        {"category": category_id, "page": page, "size": limit},
-        {"category_slug": category_id, "page": page, "size": limit},
-    ]
-    data: Any = None
-    for params in params_variants:
-        data = await _catalog_get_json("/api/products", params=params)
-        if data is not None:
-            break
-
-    used_products_endpoint = data is not None
+    offset = (page - 1) * limit
+    data = await _catalog_get_json(f"/api/categories/{category_id}")
+    used_products_endpoint = False
+    used_params: Optional[Dict[str, Any]] = None
     if data is None:
-        data = await _catalog_get_json(f"/api/categories/{category_id}")
+        params_variants: List[Dict[str, Any]] = [
+            {"category": category_id, "page": page, "limit": limit},
+            {"category_slug": category_id, "page": page, "limit": limit},
+            {"categorySlug": category_id, "page": page, "limit": limit},
+            {"category": category_id, "offset": offset, "limit": limit},
+            {"category_slug": category_id, "offset": offset, "limit": limit},
+            {"category": category_id, "skip": offset, "limit": limit},
+            {"category_slug": category_id, "skip": offset, "limit": limit},
+            {"category": category_id, "page": page, "size": limit},
+            {"category_slug": category_id, "page": page, "size": limit},
+        ]
+        for params in params_variants:
+            data = await _catalog_get_json("/api/products", params=params)
+            if data is not None:
+                used_params = params
+                used_products_endpoint = True
+                break
     items: Any = None
     if isinstance(data, dict):
         items = data.get("products") or data.get("items") or data.get("data") or data.get("results")
@@ -743,16 +850,206 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
     if not isinstance(items, list):
         return None
 
+    # Если нет данных о пагинации, пробуем собрать все страницы вручную
+    if used_products_endpoint and used_params and isinstance(data, dict):
+        total_from_api = data.get("total") or data.get("count") or data.get("totalCount")
+        skip_from_api = data.get("skip") or data.get("offset")
+        has_pagination_meta = isinstance(total_from_api, int) and isinstance(skip_from_api, int)
+        if not has_pagination_meta:
+            items = list(items)
+            next_page = page
+            next_offset = offset
+            for _ in range(1, 20):
+                next_params = dict(used_params)
+                if "page" in next_params:
+                    next_page += 1
+                    next_params["page"] = next_page
+                    if "offset" in next_params or "skip" in next_params:
+                        next_offset += limit
+                        if "offset" in next_params:
+                            next_params["offset"] = next_offset
+                        if "skip" in next_params:
+                            next_params["skip"] = next_offset
+                else:
+                    next_offset += limit
+                    if "offset" in next_params:
+                        next_params["offset"] = next_offset
+                    if "skip" in next_params:
+                        next_params["skip"] = next_offset
+                data_page = await _catalog_get_json("/api/products", params=next_params)
+                if data_page is None:
+                    break
+                page_items: Any = None
+                if isinstance(data_page, dict):
+                    page_items = data_page.get("products") or data_page.get("items") or data_page.get("data") or data_page.get("results")
+                if page_items is None:
+                    page_items = data_page
+                if not isinstance(page_items, list) or not page_items:
+                    break
+                items.extend(page_items)
+                if len(page_items) < limit:
+                    break
+
     uniq: Dict[str, Dict[str, Any]] = {}
+    variants_by_product: Dict[str, Dict[str, Any]] = {}
     for raw in items:
         if not isinstance(raw, dict):
             continue
         base_pid = raw.get("product_id") or raw.get("base_product_id") or raw.get("baseProductId")
-        looks_like_variant = base_pid is not None and (raw.get("color_id") is not None or raw.get("colorId") is not None or raw.get("label") is not None or raw.get("hex") is not None)
-        pid = base_pid if looks_like_variant else (raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid"))
+        pid = raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid")
         if pid is None:
             continue
-        name = str(raw.get("name") or raw.get("title") or raw.get("product_name") or raw.get("base_title") or "").strip() or str(pid)
+        slug = str(raw.get("slug") or raw.get("product_slug") or raw.get("base_slug") or "").strip()
+        # Расширенный поиск имени товара
+        name = str(
+            raw.get("name") or raw.get("title") or raw.get("product_name") or 
+            raw.get("base_title") or raw.get("productName") or raw.get("label") or 
+            raw.get("display_name") or raw.get("displayName") or ""
+        ).strip()
+        if not name or name.isdigit():
+            name = slug if slug and not slug.isdigit() else ""
+        if not name:
+            name = f"Товар {pid}"
+        description = str(raw.get("description") or raw.get("desc") or "").strip()
+        url = str(raw.get("url") or raw.get("link") or "").strip()
+        price = raw.get("price") or raw.get("cost")
+        main_category = raw.get("main_category") if isinstance(raw.get("main_category"), dict) else {}
+        category_names: List[str] = []
+        main_name = str(main_category.get("name") or "").strip()
+        if main_name:
+            category_names.append(main_name)
+        category_path = raw.get("categoryPath")
+        if isinstance(category_path, list):
+            for it in category_path:
+                if isinstance(it, dict):
+                    cname = str(it.get("name") or it.get("title") or "").strip()
+                else:
+                    cname = str(it).strip()
+                if cname:
+                    category_names.append(cname)
+        images: List[str] = []
+        for k in ("primary_image", "image", "cover"):
+            u = _extract_image_url(raw.get(k))
+            if u:
+                images = [u]
+                break
+        if not images and isinstance(raw.get("images"), list):
+            imgs = [_extract_image_url(x) for x in raw.get("images")]
+            images = [x for x in imgs if x]
+        product_id = str(base_pid) if base_pid is not None else str(pid)
+        color_id = raw.get("color_id") or raw.get("colorId") or raw.get("product_color_id") or raw.get("productColorId") or raw.get("id")
+        color_name = str(
+            raw.get("label") or raw.get("color") or raw.get("color_name") or raw.get("colorName") or ""
+        ).strip()
+        if product_id not in variants_by_product:
+            variants_by_product[product_id] = {
+                "id": product_id,
+                "base_id": str(base_pid) if base_pid is not None else None,
+                "name": name,
+                "slug": slug,
+                "description": description,
+                "url": url,
+                "price": price,
+                "images": images,
+                "colors": [],
+                "color_entries": [],
+                "images_by_color": {},
+                "categories": category_names,
+            }
+        if color_name:
+            if color_name not in variants_by_product[product_id]["colors"]:
+                variants_by_product[product_id]["colors"].append(color_name)
+        if color_id is not None:
+            variants_by_product[product_id]["color_entries"].append({"id": str(color_id), "name": color_name or ""})
+            if images:
+                variants_by_product[product_id]["images_by_color"][color_name or str(color_id)] = images
+                _catalog_cache["color_images"][str(color_id)] = {"ts": datetime.utcnow().timestamp(), "data": images}
+        uniq_key = product_id
+        if uniq_key not in uniq:
+            uniq[uniq_key] = {
+                "id": product_id,
+                "base_id": str(base_pid) if base_pid is not None else None,
+                "name": name,
+                "slug": slug,
+                "description": description,
+                "url": url,
+                "price": price,
+                "images": images,
+                "colors": [],
+                "color_entries": [],
+                "images_by_color": {},
+                "categories": category_names,
+            }
+
+    all_products = list(uniq.values())
+    if variants_by_product:
+        _catalog_cache["product_variants"] = {
+            "ts": datetime.utcnow().timestamp(),
+            "data": variants_by_product,
+        }
+    
+    # Определяем, поддерживает ли API пагинацию
+    api_has_pagination = False
+    total_from_api = None
+    if used_products_endpoint and isinstance(data, dict):
+        total_from_api = data.get("total") or data.get("count") or data.get("totalCount")
+        skip_from_api = data.get("skip") or data.get("offset")
+        if isinstance(total_from_api, int) and isinstance(skip_from_api, int):
+            api_has_pagination = True
+    
+    if api_has_pagination and total_from_api is not None:
+        # API поддерживает пагинацию
+        has_next = (offset + limit) < total_from_api
+        normalized = all_products[:limit]
+    else:
+        # API не поддерживает пагинацию - кешируем все товары и делаем локальную нарезку
+        _catalog_cache["products"][all_key] = {"ts": datetime.utcnow().timestamp(), "data": all_products}
+        start = (page - 1) * limit
+        normalized = all_products[start:start + limit]
+        has_next = (start + limit) < len(all_products)
+    
+    return {"items": normalized, "has_next": has_next}
+
+
+async def catalog_search_products(query: str, limit: int = 12) -> List[Dict[str, Any]]:
+    if not query:
+        return []
+    limit = max(1, min(int(limit or 12), 100))
+    params_variants: List[Dict[str, Any]] = [
+        {"search": query, "limit": limit, "page": 1},
+        {"q": query, "limit": limit, "page": 1},
+        {"query": query, "limit": limit, "page": 1},
+    ]
+    data: Any = None
+    for params in params_variants:
+        data = await _catalog_get_json("/api/products", params=params)
+        if data is not None:
+            break
+    items: Any = None
+    if isinstance(data, dict):
+        items = data.get("products") or data.get("items") or data.get("data") or data.get("results")
+    if items is None:
+        items = data
+    if not isinstance(items, list):
+        return []
+    normalized: List[Dict[str, Any]] = []
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        base_pid = raw.get("product_id") or raw.get("base_product_id") or raw.get("baseProductId")
+        pid = raw.get("id") or raw.get("product_id") or raw.get("base_product_id") or raw.get("uuid")
+        if pid is None:
+            continue
+        slug = str(raw.get("slug") or raw.get("product_slug") or raw.get("base_slug") or "").strip()
+        name = str(
+            raw.get("name") or raw.get("title") or raw.get("product_name") or
+            raw.get("base_title") or raw.get("productName") or raw.get("label") or
+            raw.get("display_name") or raw.get("displayName") or ""
+        ).strip()
+        if not name or name.isdigit():
+            name = slug if slug and not slug.isdigit() else ""
+        if not name:
+            name = f"Товар {pid}"
         description = str(raw.get("description") or raw.get("desc") or "").strip()
         url = str(raw.get("url") or raw.get("link") or "").strip()
         price = raw.get("price") or raw.get("cost")
@@ -765,30 +1062,32 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
         if not images and isinstance(raw.get("images"), list):
             imgs = [_extract_image_url(x) for x in raw.get("images")]
             images = [x for x in imgs if x]
-        pid_str = str(pid)
-        if pid_str not in uniq:
-            uniq[pid_str] = {
-                "id": pid_str,
-                "name": name,
-                "description": description,
-                "url": url,
-                "price": price,
-                "images": images,
-                "colors": [],
-                "color_entries": [],
-                "images_by_color": {},
-            }
-
-    all_products = list(uniq.values())
-    if used_products_endpoint:
-        normalized = all_products[:limit]
-    else:
-        start = max(0, (page - 1) * limit)
-        normalized = all_products[start:start + limit]
-    _catalog_cache["products"][key] = {"ts": datetime.utcnow().timestamp(), "data": normalized}
+        color_name = str(
+            raw.get("label") or raw.get("color") or raw.get("color_name") or raw.get("colorName") or ""
+        ).strip()
+        product_id = str(base_pid) if base_pid is not None else str(pid)
+        entry = {
+            "id": product_id,
+            "base_id": str(base_pid) if base_pid is not None else None,
+            "name": name,
+            "slug": slug,
+            "description": description,
+            "url": url,
+            "price": price,
+            "images": images,
+            "colors": [color_name] if color_name else [],
+            "color_entries": [{"id": str(raw.get("color_id") or raw.get("colorId") or raw.get("id")), "name": color_name}] if color_name else [],
+            "categories": [],
+        }
+        normalized.append(entry)
     return normalized
 
 async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
+    cached_variants = _catalog_cache.get("product_variants") or {}
+    if cached_variants.get("data") and _catalog_is_fresh(cached_variants.get("ts", 0.0)):
+        pv = cached_variants["data"].get(str(product_id))
+        if pv:
+            return pv
     cached = _catalog_cache["product"].get(product_id)
     if cached and _catalog_is_fresh(cached["ts"]):
         return cached["data"]
@@ -798,10 +1097,20 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
     if not isinstance(base, dict):
         return None
     pid = base.get("id") or base.get("product_id") or base.get("uuid") or product_id
-    name = str(base.get("name") or base.get("title") or base.get("product_name") or "").strip() or str(pid)
+    slug = str(base.get("slug") or base.get("product_slug") or base.get("base_slug") or "").strip()
+    name = str(
+        base.get("name") or base.get("title") or base.get("product_name") or
+        base.get("base_title") or base.get("productName") or base.get("label") or
+        base.get("display_name") or base.get("displayName") or ""
+    ).strip()
+    if not name or name.isdigit():
+        name = slug if slug and not slug.isdigit() else ""
+    if not name:
+        name = f"Товар {pid}"
     description = str(base.get("description") or base.get("desc") or "").strip()
     url = str(base.get("url") or base.get("link") or "").strip()
     price = base.get("price") or base.get("cost")
+    base_id = base.get("product_id") or base.get("base_product_id") or base.get("baseProductId")
 
     images: List[str] = []
     for k in ("primary_image", "image", "cover"):
@@ -827,7 +1136,9 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
 
     product: Dict[str, Any] = {
         "id": str(pid),
+        "base_id": str(base_id) if base_id is not None else None,
         "name": name,
+        "slug": slug,
         "description": description,
         "url": url,
         "price": price,
@@ -853,14 +1164,69 @@ async def catalog_get_color_images(product_color_id: str) -> List[str]:
     _catalog_cache["color_images"][product_color_id] = {"ts": datetime.utcnow().timestamp(), "data": urls}
     return urls
 
+async def catalog_get_color_sizes(product_color_id: str) -> List[Dict[str, Any]]:
+    data = await _catalog_get_json(f"/api/products/colors/{product_color_id}/sizes")
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or it.get("label") or it.get("title") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "name": name,
+            "available": it.get("available") if "available" in it else it.get("in_stock"),
+            "qty": it.get("qty") or it.get("stock"),
+        })
+    return out
+
+async def catalog_get_collections() -> List[Dict[str, Any]]:
+    data = await _catalog_get_json("/api/collections")
+    if not isinstance(data, list):
+        if isinstance(data, dict):
+            data = data.get("items") or data.get("data") or data.get("results") or []
+    if not isinstance(data, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or it.get("title") or it.get("collection_name") or "").strip()
+        if not name:
+            continue
+        out.append({
+            "id": str(it.get("id") or it.get("collection_id") or name),
+            "name": name,
+            "description": str(it.get("description") or it.get("desc") or "").strip(),
+        })
+    return out
+
+async def catalog_get_product_categories(product_id: str) -> List[str]:
+    data = await _catalog_get_json(f"/api/products/base/{product_id}/categories")
+    if isinstance(data, dict):
+        data = data.get("items") or data.get("data") or data.get("results") or data.get("categories")
+    if not isinstance(data, list):
+        return []
+    names: List[str] = []
+    for it in data:
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get("name") or it.get("title") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
 def tg_product_caption(p: Dict[str, Any], color: Optional[str] = None) -> str:
     name = _tg_to_html(str(p.get("name") or "Товар"))
     desc = _tg_to_html(str(p.get("description") or ""))
     url = str(p.get("url") or "")
     price = p.get("price")
+    price_text = _format_price(price)
     parts = [f"<b>{name}</b>"]
-    if price is not None and str(price).strip():
-        parts.append(f"<b>Цена:</b> {html.escape(str(price))}")
+    if price_text:
+        parts.append(f"<b>Цена:</b> {html.escape(price_text)}")
     if color:
         parts.append(f"<b>Цвет:</b> {html.escape(color)}")
     if desc:
@@ -909,7 +1275,6 @@ def _tg_product_kb(product_id: str, colors: List[str], selected_color_idx: int, 
         if color_row:
             rows.append(color_row)
     rows.append([{"text": "🧠 Спросить ИИ", "data": f"m:ask:{product_id}"}])
-    rows.append([{"text": "👤 Менеджер", "data": "m:manager"}])
     rows.append([{"text": "⬅️ Назад", "data": back_data}])
     rows.append([{"text": "🏠 Меню", "data": "m:home"}])
     return _tg_kb(rows)
@@ -948,6 +1313,667 @@ async def _tg_download_as_input_file(url: str) -> Optional[Dict[str, Any]]:
         if current_session != http_session:
             await current_session.close()
 
+def _ai_strip_html(raw: str) -> str:
+    if not raw:
+        return ""
+    cleaned = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+def _ai_tokenize(text: str) -> List[str]:
+    base = _normalize(text)
+    return [t for t in re.split(r"[^a-zа-я0-9]+", base) if t]
+
+def _ai_score(query_tokens: List[str], chunk_tokens: List[str]) -> float:
+    if not query_tokens or not chunk_tokens:
+        return 0.0
+    query_set = set(query_tokens)
+    chunk_set = set(chunk_tokens)
+    overlap = len(query_set.intersection(chunk_set))
+    return overlap / max(len(query_set), 1)
+
+def _ai_parse_lines(raw: str) -> List[str]:
+    return [line.strip() for line in (raw or "").splitlines() if line.strip()]
+
+def _ai_is_order_question(text_norm: str) -> bool:
+    keywords = [
+        "заказ", "трек", "трекномер", "номер заказа", "статус заказа", "order", "tracking", "track",
+    ]
+    return any(k in text_norm for k in keywords)
+
+def _ai_is_greeting(text_norm: str) -> bool:
+    greetings = [
+        "привет", "здравствуйте", "добрый", "салют", "хай", "hello", "hi", "hey",
+        "good morning", "good afternoon", "good evening",
+    ]
+    tokens = _ai_tokenize(text_norm)
+    if not tokens:
+        return False
+    if any(g in text_norm for g in greetings):
+        # Если есть вопрос/смысловая часть — пусть отвечает модель
+        if "?" in text_norm:
+            return False
+        if len(tokens) > 3:
+            return False
+        return True
+    return False
+
+def _ai_is_greeting_fuzzy(text_norm: str) -> bool:
+    tokens = _ai_tokenize(text_norm)
+    if not tokens:
+        return False
+    candidates = [
+        "привет", "здравствуйте", "здорово", "добрый", "доброе", "добрыйвечер", "доброеутро",
+        "hi", "hello", "hey", "goodmorning", "goodafternoon", "goodevening",
+    ]
+    for t in tokens[:3]:
+        if len(t) > 12:
+            continue
+        for c in candidates:
+            if difflib.SequenceMatcher(a=t, b=c).ratio() >= 0.8:
+                return True
+    return False
+
+def _ai_is_recommendation(text_norm: str) -> bool:
+    keys = ["посовет", "рекоменд", "какой товар", "что купить", "что посовету"]
+    return any(k in text_norm for k in keys)
+
+def _ai_has_product_intent(text_norm: str) -> bool:
+    keywords = [
+        "футболк", "худи", "свитшот", "лонгслив", "толстовк", "куртк", "жилет",
+        "штаны", "брюк", "шорт", "юбк", "плать", "кофт", "свитер", "кардиган",
+        "кепк", "шапк", "шарф", "перчатк", "носк", "аксессуар", "сумк", "рюкзак",
+        "джинс", "спортивн", "комплект",
+    ]
+    if _ai_is_recommendation(text_norm):
+        return True
+    return any(k in text_norm for k in keywords)
+
+def _ai_is_latin(text: str) -> bool:
+    return bool(re.search(r"[a-z]", text.lower()))
+
+def _ai_build_history(messages: List[Dict[str, Any]], max_items: int = 6) -> str:
+    if not messages:
+        return ""
+    trimmed = messages[-max_items:]
+    lines: List[str] = []
+    for m in trimmed:
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        role = "Ассистент" if m.get("ai") else "Пользователь"
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines).strip()
+
+def _ai_get_previous_user_message(messages: List[Dict[str, Any]], current_text: str) -> Optional[str]:
+    if not messages:
+        return None
+    current_norm = _normalize(current_text)
+    for m in reversed(messages):
+        if m.get("ai"):
+            continue
+        content = str(m.get("content") or "").strip()
+        if not content:
+            continue
+        if _normalize(content) == current_norm:
+            continue
+        return content
+    return None
+
+def _ai_is_history_question(text_norm: str) -> bool:
+    keys = [
+        "что я писал", "что я написал", "что писал", "что писал до",
+        "что я писал до", "что я писал ранее", "что я писал перед",
+        "что писал ранее", "что писал перед", "что писал до этого",
+    ]
+    return any(k in text_norm for k in keys)
+
+def _ai_greeting_reply(raw_text: str) -> str:
+    if _ai_is_latin(raw_text):
+        return "Hello! I’m the PSIH AI assistant. How can I help with products, shipping, or returns?"
+    return "Привет! Я AI-ассистент PSIH. Чем могу помочь по товарам, доставке или возвратам?"
+
+def _ai_handoff_reply(reason: Optional[str]) -> str:
+    if reason in {"user_request", "orders"}:
+        return "Я позвал менеджера. Напишите, что нужно — он подключится."
+    return "Не нашёл информацию на сайте — подключаю менеджера."
+
+def _ai_soft_refusal_reply() -> str:
+    return (
+        "Я не помогаю с такими вопросами. "
+        "Могу ответить по товарам, доставке или возвратам. "
+        "Если хотите менеджера — напишите «менеджер»."
+    )
+
+def _ai_generic_fallback_reply() -> str:
+    return (
+        "Могу помочь по товарам, доставке или возвратам. "
+        "Напишите, что именно вас интересует."
+    )
+
+def _ai_recommendation_reply() -> str:
+    return (
+        "С удовольствием помогу с выбором. "
+        "Напишите, что именно ищете (тип вещи, размер, бюджет, цвет) — подберу варианты. "
+        "Либо откройте «Каталог»."
+    )
+
+async def _ai_get_settings(db: AsyncSession) -> Dict[str, Any]:
+    cached = AI_SETTINGS_CACHE.get("data")
+    if cached and (datetime.utcnow().timestamp() - AI_SETTINGS_CACHE.get("ts", 0.0)) < AI_SETTINGS_TTL_SECONDS:
+        return cached
+
+    settings = await get_ai_settings(db)
+    if not settings:
+        settings = await upsert_ai_settings(db, DEFAULT_AI_SETTINGS.copy())
+    data = {
+        "system_message": settings.system_message or DEFAULT_AI_SETTINGS["system_message"],
+        "faqs": settings.faqs or "",
+        "rules": settings.rules or DEFAULT_AI_SETTINGS["rules"],
+        "tone": settings.tone or DEFAULT_AI_SETTINGS["tone"],
+        "handoff_phrases": settings.handoff_phrases or DEFAULT_AI_SETTINGS["handoff_phrases"],
+        "min_score": float(settings.min_score) if settings.min_score is not None else DEFAULT_AI_SETTINGS["min_score"],
+        "site_pages": settings.site_pages or "",
+        "auto_refresh_minutes": int(settings.auto_refresh_minutes or 0),
+    }
+    AI_SETTINGS_CACHE["data"] = data
+    AI_SETTINGS_CACHE["ts"] = datetime.utcnow().timestamp()
+    return data
+
+async def _ai_fetch_page_text(url: str) -> str:
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+            if resp.status != 200:
+                return ""
+            text = await resp.text()
+            return _ai_strip_html(text)
+    except Exception:
+        return ""
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
+async def _ai_collect_products(limit: int) -> List[Dict[str, Any]]:
+    categories = await catalog_get_categories()
+    if not categories:
+        return []
+    products: List[Dict[str, Any]] = []
+    for c in categories:
+        if len(products) >= limit:
+            break
+        category_id = str(c.get("slug") or "")
+        if not category_id:
+            continue
+        page = 1
+        while len(products) < limit:
+            items_data = await catalog_get_products(category_id, page=page, limit=AI_PRODUCTS_PAGE)
+            if not items_data:
+                break
+            items = items_data.get("items") or []
+            products.extend(items)
+            if not items_data.get("has_next"):
+                break
+            page += 1
+            if page > 10:
+                break
+    return products[:limit]
+
+async def _ai_build_knowledge(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
+    chunks: List[Dict[str, Any]] = []
+
+    categories = await catalog_get_categories()
+    logging.info(f"📚 Building knowledge base: {len(categories) if categories else 0} categories")
+    if categories:
+        cat_names = ", ".join([str(c.get("name")) for c in categories if c.get("name")])
+        if cat_names:
+            chunks.append({
+                "text": f"Категории: {cat_names}",
+                "source": "categories",
+                "tags": ["categories"],
+            })
+
+    collections = await catalog_get_collections()
+    logging.info(f"📚 Loading {len(collections)} collections")
+    for col in collections:
+        text = f"Коллекция: {col.get('name')}"
+        if col.get("description"):
+            text += f". Описание: {col.get('description')}"
+        chunks.append({
+            "text": text,
+            "source": f"collection:{col.get('id')}",
+            "tags": ["collection"],
+        })
+
+    products = await _ai_collect_products(AI_MAX_PRODUCTS)
+    logging.info(f"📚 Loading {len(products)} products")
+    for p in products:
+        text = f"Товар: {p.get('name')}"
+        price_text = _format_price(p.get("price"))
+        if price_text:
+            text += f". Цена: {price_text}"
+        if p.get("description"):
+            text += f". Описание: {p.get('description')}"
+        if p.get("colors"):
+            text += f". Цвета: {', '.join([str(x) for x in p.get('colors') if x])}"
+        if p.get("url"):
+            text += f". Ссылка: {p.get('url')}"
+        chunks.append({
+            "text": text,
+            "source": f"product:{p.get('id')}",
+            "tags": ["product"],
+            "meta": {"product_id": str(p.get("id"))},
+        })
+
+    for url in _ai_parse_lines(settings.get("site_pages", "")):
+        content = await _ai_fetch_page_text(url)
+        if content:
+            chunks.append({
+                "text": content,
+                "source": f"page:{url}",
+                "tags": ["page"],
+            })
+
+    faqs_text = settings.get("faqs") or ""
+    if faqs_text.strip():
+        chunks.append({
+            "text": faqs_text.strip(),
+            "source": "admin_faqs",
+            "tags": ["faq"],
+        })
+
+    return chunks
+
+async def _ai_load_knowledge(db: AsyncSession) -> List[Dict[str, Any]]:
+    cached = AI_KNOWLEDGE_CACHE.get("data")
+    if cached and (datetime.utcnow().timestamp() - AI_KNOWLEDGE_CACHE.get("ts", 0.0)) < AI_KNOWLEDGE_TTL_SECONDS:
+        return cached
+
+    knowledge = await get_ai_knowledge(db)
+    if knowledge and isinstance(knowledge.data, list):
+        chunks = knowledge.data
+    else:
+        settings = await _ai_get_settings(db)
+        chunks = await _ai_build_knowledge(settings)
+        await save_ai_knowledge(db, chunks)
+    AI_KNOWLEDGE_CACHE["data"] = chunks
+    AI_KNOWLEDGE_CACHE["tokens"] = [_ai_tokenize(c.get("text", "")) for c in chunks]
+    AI_KNOWLEDGE_CACHE["ts"] = datetime.utcnow().timestamp()
+    return chunks
+
+async def _ai_reindex(db: AsyncSession) -> Dict[str, Any]:
+    settings = await _ai_get_settings(db)
+    try:
+        chunks = await _ai_build_knowledge(settings)
+        await save_ai_knowledge(db, chunks)
+        AI_KNOWLEDGE_CACHE["data"] = chunks
+        AI_KNOWLEDGE_CACHE["tokens"] = [_ai_tokenize(c.get("text", "")) for c in chunks]
+        AI_KNOWLEDGE_CACHE["ts"] = datetime.utcnow().timestamp()
+        AI_STATUS["last_indexed"] = datetime.utcnow().isoformat()
+        AI_STATUS["last_error"] = None
+        AI_STATUS["chunks"] = len(chunks)
+        return {"ok": True, "chunks": len(chunks)}
+    except Exception as e:
+        AI_STATUS["last_error"] = str(e)
+        return {"ok": False, "error": str(e)}
+
+async def _ai_auto_refresh_loop() -> None:
+    while True:
+        try:
+            async with async_session() as session:
+                settings = await _ai_get_settings(session)
+                minutes = int(settings.get("auto_refresh_minutes") or 0)
+                if minutes > 0:
+                    await _ai_reindex(session)
+                    await asyncio.sleep(minutes * 60)
+                else:
+                    await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(60)
+
+async def _ai_openrouter(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not OPENAI_API_KEY:
+        logging.error("❌ OpenAI API key not found")
+        return None
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": 0.2,
+        "max_tokens": 600,
+    }
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        logging.info(f"🤖 Sending request to OpenAI API with model: {OPENAI_MODEL}")
+        async with current_session.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=OPENAI_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logging.error(f"❌ OpenAI API error {resp.status}: {error_text}")
+                return None
+            data = await resp.json()
+            logging.info("✅ OpenAI API response received")
+            return data
+    except Exception as e:
+        logging.error(f"❌ OpenAI API exception: {e}")
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
+def _ai_extract_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    match = re.search(r"\{[\s\S]*\}", text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except Exception:
+        return None
+
+async def _ai_build_sizes_context(product_id: str) -> str:
+    product = await catalog_get_product(product_id)
+    if not product:
+        return ""
+    parts: List[str] = []
+    for entry in product.get("color_entries", []):
+        sizes = await catalog_get_color_sizes(str(entry.get("id")))
+        if not sizes:
+            continue
+        label = entry.get("name") or "Цвет"
+        sizes_text = []
+        for s in sizes:
+            if s.get("available") is False:
+                sizes_text.append(f"{s.get('name')} (нет)")
+            elif s.get("qty"):
+                sizes_text.append(f"{s.get('name')} (в наличии: {s.get('qty')})")
+            else:
+                sizes_text.append(str(s.get("name")))
+        if sizes_text:
+            parts.append(f"{label}: {', '.join(sizes_text)}")
+    if not parts:
+        return ""
+    return "Размеры и наличие по цветам:\n" + "\n".join(parts)
+
+async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Optional[str] = None, product_id: Optional[str] = None, product_categories: Optional[List[str]] = None, conversation_history: Optional[str] = None, previous_user_message: Optional[str] = None) -> Dict[str, Any]:
+    settings = await _ai_get_settings(db)
+    text_norm = _normalize(question)
+    
+    # Только критичные проверки - остальное пусть обрабатывает AI
+    if _ai_is_order_question(text_norm):
+        return {"handoff": True, "answer": "", "confidence": 0.0, "reason": "orders"}
+
+    phrases = _ai_parse_lines(settings.get("handoff_phrases", ""))
+    if any(p in text_norm for p in [_normalize(p) for p in phrases] if p):
+        return {"handoff": True, "answer": "", "confidence": 0.0, "reason": "user_request"}
+
+    if previous_user_message and _ai_is_history_question(text_norm):
+        return {
+            "handoff": False,
+            "answer": f"Вы писали: {previous_user_message}",
+            "confidence": 1.0,
+            "reason": "history_answer",
+        }
+
+    context_parts: List[str] = []
+    top_score = 0.0
+    min_score = float(settings.get("min_score") or DEFAULT_AI_SETTINGS["min_score"])
+    context_text = ""
+
+    if not extra_context and _ai_has_product_intent(text_norm):
+        search_products = await catalog_search_products(question, limit=12)
+        if search_products:
+            lines: List[str] = []
+            for p in search_products:
+                price_text = _format_price(p.get("price"))
+                colors = ", ".join(p.get("colors") or [])
+                line = f"- {p.get('name')}"
+                if price_text:
+                    line += f" ({price_text} ₽)"
+                if colors:
+                    line += f", цвета: {colors}"
+                if p.get("url"):
+                    line += f", ссылка: {p.get('url')}"
+                lines.append(line)
+            context_text = "Подборка товаров по запросу пользователя:\n" + "\n".join(lines)
+
+    if not context_text and extra_context:
+        context_parts.append(extra_context.strip())
+        if ("размер" in text_norm or "налич" in text_norm) and product_id:
+            sizes_ctx = await _ai_build_sizes_context(str(product_id))
+            if sizes_ctx:
+                context_parts.append(sizes_ctx)
+        context_text = "\n\n".join([p for p in context_parts if p])
+    elif not context_text:
+        chunks = await _ai_load_knowledge(db)
+        logging.info(f"🔍 Knowledge base loaded: {len(chunks)} chunks")
+        tokens = _ai_tokenize(question)
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for idx, c in enumerate(chunks):
+            chunk_tokens = AI_KNOWLEDGE_CACHE["tokens"][idx] if idx < len(AI_KNOWLEDGE_CACHE["tokens"]) else _ai_tokenize(c.get("text", ""))
+            score = _ai_score(tokens, chunk_tokens)
+            if score > 0:
+                scored.append((score, c))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_score = scored[0][0] if scored else 0.0
+        logging.info(f"🎯 Search scores - Top: {top_score:.3f}, Min required: {min_score:.3f}, Total matches: {len(scored)}")
+        if top_score < min_score:
+            context_text = "Общий запрос пользователя. Ответь вежливо и нейтрально, без фактов, и предложи помощь по товарам, доставке или возвратам."
+        else:
+            top_chunks = [c for _, c in scored[:AI_TOP_K]]
+            if "размер" in text_norm or "налич" in text_norm:
+                for c in top_chunks:
+                    meta = c.get("meta") or {}
+                    pid = meta.get("product_id")
+                    if pid:
+                        sizes_ctx = await _ai_build_sizes_context(str(pid))
+                        if sizes_ctx:
+                            context_parts.append(sizes_ctx)
+                        break
+
+            context_parts.extend([c.get("text", "") for c in top_chunks if c.get("text")])
+            context_text = "\n\n".join([p for p in context_parts if p])
+    if not context_text:
+        context_text = "Общий запрос пользователя. Ответь вежливо и нейтрально, без фактов, и предложи помощь по товарам, доставке или возвратам."
+
+    if conversation_history:
+        context_text = f"История диалога:\n{conversation_history}\n\n{context_text}"
+
+    system_message = settings.get("system_message") or DEFAULT_AI_SETTINGS["system_message"]
+    rules = settings.get("rules") or DEFAULT_AI_SETTINGS["rules"]
+    tone = settings.get("tone") or DEFAULT_AI_SETTINGS["tone"]
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"{system_message}\n\n"
+                f"Тон: {tone}\n"
+                f"Правила: {rules}\n"
+                "Ответ обязан быть основан только на контексте ниже.\n"
+                "Если информации недостаточно — ответь нейтрально и предложи помощь по товарам, доставке или возвратам.\n"
+                "Историю диалога можно использовать, если она есть в контексте.\n"
+                "Верни JSON без Markdown."
+            )
+        },
+        {
+            "role": "user",
+            "content": f"Контекст:\n{context_text}\n\nВопрос: {question}\n\nВерни JSON формата: {{\"answer\":\"...\",\"handoff\":false,\"confidence\":0.0}}"
+        }
+    ]
+    data = await _ai_openrouter(messages)
+    if not data:
+        return {"handoff": True, "answer": "", "confidence": top_score, "reason": "llm_error"}
+
+    content = ""
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        content = ""
+    parsed = _ai_extract_json(content) or {}
+    answer = str(parsed.get("answer") or "").strip()
+    handoff = bool(parsed.get("handoff"))
+    if handoff:
+        if answer:
+            return {"handoff": False, "answer": answer, "confidence": float(parsed.get("confidence") or top_score), "reason": "model_handoff_ignored"}
+        return {"handoff": False, "answer": _ai_generic_fallback_reply(), "confidence": top_score, "reason": "model_handoff_fallback"}
+    if not answer:
+        return {"handoff": False, "answer": _ai_generic_fallback_reply(), "confidence": top_score, "reason": "empty_answer_fallback"}
+    return {
+        "handoff": handoff,
+        "answer": answer,
+        "confidence": float(parsed.get("confidence") or top_score),
+        "reason": "model_handoff" if handoff else "ok",
+    }
+
+
+# ================== AI Аналитика диалогов ==================
+
+DIALOG_ANALYTICS_PROMPT = """
+Ты — AI-аналитик диалогов службы поддержки. Проанализируй переписку между клиентом и менеджером.
+
+Верни JSON со следующими полями:
+{
+  "summary": "Краткое резюме диалога (2-3 предложения)",
+  "customer_problem": "Описание проблемы/вопроса клиента",
+  "customer_intent": "Намерение клиента: purchase (покупка), refund (возврат), question (вопрос), complaint (жалоба), other (другое)",
+  "refund_reason": "Если клиент хочет возврат - укажи причину, иначе null",
+  "manager_quality_score": число от 1 до 10 (оценка работы менеджера),
+  "manager_quality_notes": "Комментарий к оценке менеджера",
+  "customer_sentiment": "positive, neutral или negative (настроение клиента)",
+  "resolution_status": "resolved (решено), pending (в процессе), escalated (требует внимания руководства)",
+  "key_topics": ["список", "ключевых", "тем"],
+  "recommendations": "Рекомендации для улучшения сервиса (если есть)"
+}
+
+Критерии оценки менеджера:
+- Скорость и точность ответов
+- Вежливость и профессионализм
+- Решение проблемы клиента
+- Знание продукта/услуг
+
+Отвечай ТОЛЬКО JSON без дополнительного текста или markdown.
+"""
+
+async def _ai_analyze_dialog(messages: List[Dict[str, Any]], manager_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """
+    Анализирует диалог с помощью AI и возвращает структурированную аналитику.
+    
+    Args:
+        messages: Список сообщений диалога
+        manager_name: Имя менеджера (опционально)
+    
+    Returns:
+        Dict с результатами анализа или None при ошибке
+    """
+    if not OPENAI_API_KEY:
+        logging.error("❌ OpenAI API key not found for dialog analytics")
+        return None
+    
+    if not messages:
+        logging.warning("⚠️ No messages to analyze")
+        return None
+    
+    # Форматируем диалог для AI
+    dialog_text = []
+    for msg in messages:
+        role = "Клиент" if msg.get("message_type") == "question" else "Менеджер"
+        if msg.get("ai"):
+            role = "AI-бот"
+        content = msg.get("content") or msg.get("message", "")
+        timestamp = msg.get("timestamp") or msg.get("created_at", "")
+        if isinstance(timestamp, datetime):
+            timestamp = timestamp.isoformat()
+        dialog_text.append(f"[{timestamp}] {role}: {content}")
+    
+    dialog_formatted = "\n".join(dialog_text)
+    
+    if manager_name:
+        context_info = f"\nМенеджер диалога: {manager_name}\n"
+    else:
+        context_info = ""
+    
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": DIALOG_ANALYTICS_PROMPT},
+            {"role": "user", "content": f"{context_info}\nДиалог для анализа:\n\n{dialog_formatted}"}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1500,
+    }
+    
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        logging.info(f"🔍 Analyzing dialog with {len(messages)} messages")
+        async with current_session.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=aiohttp.ClientTimeout(total=60),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                logging.error(f"❌ OpenAI API error {resp.status}: {error_text}")
+                return None
+            data = await resp.json()
+            
+            content = ""
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except Exception:
+                logging.error("❌ Failed to extract content from OpenAI response")
+                return None
+            
+            parsed = _ai_extract_json(content)
+            if not parsed:
+                logging.error(f"❌ Failed to parse AI response as JSON: {content[:200]}")
+                return None
+            
+            logging.info("✅ Dialog analysis completed successfully")
+            return {
+                "summary": parsed.get("summary"),
+                "customer_problem": parsed.get("customer_problem"),
+                "customer_intent": parsed.get("customer_intent"),
+                "refund_reason": parsed.get("refund_reason"),
+                "manager_quality_score": parsed.get("manager_quality_score"),
+                "manager_quality_notes": parsed.get("manager_quality_notes"),
+                "customer_sentiment": parsed.get("customer_sentiment"),
+                "resolution_status": parsed.get("resolution_status"),
+                "key_topics": parsed.get("key_topics", []),
+                "recommendations": parsed.get("recommendations"),
+                "raw_response": parsed
+            }
+            
+    except Exception as e:
+        logging.error(f"❌ Dialog analysis exception: {e}")
+        return None
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
 
 # VK config (делаем опциональным: отсутствие VK_* не должно валить весь API)
 VK_TOKEN = os.getenv("VK_TOKEN")  # токен сообщества
@@ -955,7 +1981,7 @@ VK_GROUP_ID_RAW = os.getenv("VK_GROUP_ID")  # ID сообщества (стро�
 VK_GROUP_ID: Optional[int] = None
 if VK_GROUP_ID_RAW:
     try:
-        VK_GROUP_ID = int(VK_GROUP_ID_RAW)
+        VK_GROUP_ID = int(re.sub(r"\D", "", VK_GROUP_ID_RAW))
     except ValueError:
         logging.error("Invalid VK_GROUP_ID=%r (expected integer). VK integration will be disabled.", VK_GROUP_ID_RAW)
 else:
@@ -1090,11 +2116,11 @@ async def handle_single_event(event):
                 await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
                 return
             if cmd == "faq":
-                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(1))
+                await vk_send_message(peer_id, _vk_faq_text(1), keyboard=vk_kb_faq_menu(1))
                 return
             if cmd == "faq_page":
                 page = int(payload_data.get("page") or 1)
-                await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(page))
+                await vk_send_message(peer_id, _vk_faq_text(page), keyboard=vk_kb_faq_menu(page))
                 return
             if cmd == "faq_item":
                 item_id = str(payload_data.get("id") or "")
@@ -1116,15 +2142,17 @@ async def handle_single_event(event):
                 category_id = str(payload_data.get("id") or "")
                 page = int(payload_data.get("page") or 1)
                 limit = 6
-                items = await catalog_get_products(category_id, page=page, limit=limit)
-                if not items:
+                items_data = await catalog_get_products(category_id, page=page, limit=limit)
+                if not items_data:
                     reason = str(_catalog_cache.get("last_error") or "").strip()
                     text_out = "Каталог пустой или API недоступен."
                     if reason:
                         text_out += f"\nПричина: {reason}"
                     await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                     return
-                await vk_send_message(peer_id, f"Каталог\n\nСтраница {page}", keyboard=vk_kb_products(category_id, page, items, has_next=len(items) >= limit))
+                items = items_data.get("items") or []
+                has_next = bool(items_data.get("has_next"))
+                await vk_send_message(peer_id, f"Каталог\n\nСтраница {page}", keyboard=vk_kb_products(category_id, page, items, has_next=has_next))
                 return
             if cmd == "prod":
                 product_id = str(payload_data.get("id") or "")
@@ -1188,10 +2216,13 @@ async def handle_single_event(event):
                 state["mode"] = "ask_ai_product"
                 state["product"] = {
                     "id": product.get("id"),
+                    "base_id": product.get("base_id"),
                     "name": product.get("name"),
                     "description": product.get("description"),
                     "colors": product.get("colors", []),
                     "url": product.get("url"),
+                    "price": product.get("price"),
+                    "categories": product.get("categories", []),
                 }
                 await vk_send_message(peer_id, "Напишите вопрос по этому товару — я отвечу с учётом описания и цветов.", keyboard=vk_kb_main())
                 return
@@ -1201,13 +2232,18 @@ async def handle_single_event(event):
                 return
 
         text_norm = _normalize(text)
-        if text_norm in {"меню", "menu", "/menu", "старт", "start"}:
+        command = text_norm
+        if command.startswith("/"):
+            command = command[1:]
+        if "@" in command:
+            command = command.split("@", 1)[0]
+        if command in {"меню", "menu", "старт", "start"} or text_norm in {"/menu", "/start"}:
             await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
             return
-        if text_norm in {"faq", "/faq"}:
-            await vk_send_message(peer_id, _vk_faq_text(), keyboard=vk_kb_faq_menu(1))
+        if command == "faq" or "faq" in text_norm or "/faq" in text_norm:
+            await vk_send_message(peer_id, _vk_faq_text(1), keyboard=vk_kb_faq_menu(1))
             return
-        if text_norm in {"каталог", "товары", "товар"}:
+        if any(k in text_norm for k in {"каталог", "товары", "товар"}):
             categories = await catalog_get_categories()
             if not categories:
                 reason = str(_catalog_cache.get("last_error") or "").strip()
@@ -1249,95 +2285,96 @@ async def handle_single_event(event):
             }
             await messages_manager.broadcast(json.dumps(message_for_frontend))
 
-            # Если AI выключен — обновляем waiting и выходим
-            if not chat.ai:
-                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+        # Если AI выключен — включаем его при обычном сообщении
+        if not chat.ai:
+            if chat.waiting:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=False)
                 await updates_manager.broadcast(json.dumps({
                     "type": "chat_update",
                     "chat_id": chat.id,
-                    "waiting": True
+                    "waiting": False
                 }))
-                
-                # Отправляем уведомление админам
-                notification_manager = notifications.get_notification_manager()
-                if notification_manager:
-                    await notification_manager.send_waiting_notification(
-                        chat_id=peer_id,
-                        chat_name=user_name,
-                        messager="vk"
-                    )
-            else:
-                state = _get_state("vk", str(peer_id))
-                ai_question = text
-                if state.get("mode") == "ask_ai_product" and state.get("product"):
-                    p = state["product"]
-                    context = f"Контекст товара:\nНазвание: {p.get('name','')}\nОписание: {p.get('description','')}\nЦвета: {', '.join(p.get('colors', []))}\nСсылка: {p.get('url','')}"
-                    ai_question = f"{context}\n\nВопрос пользователя: {text}"
-                    _clear_state("vk", str(peer_id))
-                current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
-                try:
-                    async with current_session.post(
-                        API_URL,
-                        json={"question": ai_question, "chat_id": chat.id}
-                    ) as resp:
-                        data = await resp.json()
-                    
-                    if data.get("answer"):
-                        answer = data["answer"]
-                        await asyncio.to_thread(
-                            vk.messages.send,
-                            peer_id=peer_id,
-                            message=answer,
-                            random_id=0
-                        )
+            await update_chat_ai(db=session, chat_id=chat.id, ai=True)
+            chat.ai = True
+        state = _get_state("vk", str(peer_id))
+        extra_context = None
+        product_id = None
+        categories: List[str] = []
+        if state.get("mode") == "ask_ai_product" and state.get("product"):
+            p = state["product"]
+            product_id = str(p.get("base_id") or p.get("id") or "")
+            categories = p.get("categories") or []
+            if not categories and product_id:
+                categories = await catalog_get_product_categories(product_id)
+            price_text = _format_price(p.get("price"))
+            extra_context = (
+                f"Контекст товара:\nНазвание: {p.get('name','')}\n"
+                f"Описание: {p.get('description','')}\n"
+                f"Цена: {price_text}\n"
+                f"Цвета: {', '.join(p.get('colors', []))}\n"
+                f"Категории: {', '.join(categories)}\n"
+                f"Ссылка: {p.get('url','')}"
+            )
+            _clear_state("vk", str(peer_id))
+        history = await get_chat_messages(session, chat.id, limit=6)
+        history_text = _ai_build_history(history, max_items=6)
+            previous_user_message = _ai_get_previous_user_message(history, text)
+        ai_result = await _ai_answer_question(
+            session,
+            text,
+            extra_context=extra_context,
+            product_id=product_id,
+            product_categories=categories or None,
+            conversation_history=history_text,
+                previous_user_message=previous_user_message,
+        )
+        if ai_result.get("handoff"):
+            reason = ai_result.get("reason")
+            if reason in {"user_request", "orders"}:
+                await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+                await vk_send_message(peer_id, _ai_handoff_reply(reason), keyboard=vk_kb_main())
+                return
+            await vk_send_message(peer_id, _ai_soft_refusal_reply(), keyboard=vk_kb_main())
+            return
 
-                        db_ans = crud.Message(
-                            chat_id=chat.id,
-                            message=answer,
-                            message_type="answer",
-                            ai=True,
-                            created_at=datetime.utcnow()
-                        )
-                        session.add(db_ans)
-                        await session.commit()
-                        await session.refresh(db_ans)
+        answer = str(ai_result.get("answer") or "").strip()
+        answer = _normalize_price_text(answer)
+        if not answer:
+            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+            await vk_send_message(peer_id, _ai_handoff_reply(ai_result.get("reason")), keyboard=vk_kb_main())
+            return
 
-                        ans_for_frontend = {
-                            "type": "message",
-                            "chatId": str(db_ans.chat_id),
-                            "content": db_ans.message,
-                            "message_type": db_ans.message_type,
-                            "ai": db_ans.ai,
-                            "timestamp": db_ans.created_at.isoformat(),
-                            "id": db_ans.id
-                        }
-                        await messages_manager.broadcast(json.dumps(ans_for_frontend))
+        await asyncio.to_thread(
+            vk.messages.send,
+            peer_id=peer_id,
+            message=answer,
+            random_id=0
+        )
 
-                    if data.get("manager") == "true":
-                        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
-                        await update_chat_ai(db=session, chat_id=chat.id, ai=False)
-                        await updates_manager.broadcast(json.dumps({
-                            "type": "chat_update",
-                            "chat_id": chat.id,
-                            "waiting": True,
-                            "ai": False
-                        }))
-                        
-                        notification_manager = notifications.get_notification_manager()
-                        if notification_manager:
-                            await notification_manager.send_waiting_notification(
-                                chat_id=peer_id,
-                                chat_name=user_name,
-                                messager="vk"
-                            )
-                except Exception as e:
-                    logging.error(f"AI request error: {e}")
-                finally:
-                    if current_session != http_session:
-                        await current_session.close()
+        db_ans = crud.Message(
+            chat_id=chat.id,
+            message=answer,
+            message_type="answer",
+            ai=True,
+            created_at=datetime.utcnow()
+        )
+        session.add(db_ans)
+        await session.commit()
+        await session.refresh(db_ans)
 
-            # --- 4) Обработка фото-вложений ---
-            for att in attachments:
+        ans_for_frontend = {
+            "type": "message",
+            "chatId": str(db_ans.chat_id),
+            "content": db_ans.message,
+            "message_type": db_ans.message_type,
+            "ai": db_ans.ai,
+            "timestamp": db_ans.created_at.isoformat(),
+            "id": db_ans.id
+        }
+        await messages_manager.broadcast(json.dumps(ans_for_frontend))
+
+        # --- 4) Обработка фото-вложений ---
+        for att in attachments:
                 if att["type"] != "photo":
                     continue
                 
@@ -1490,8 +2527,6 @@ else:
 
 dp = Dispatcher()
 
-# API endpoint for sending questions
-API_URL = os.getenv("API_URL", "http://pavel")
 APP_HOST = os.getenv("APP_HOST", "localhost")
 MINIO_LOGIN = os.getenv("MINIO_LOGIN")
 MINIO_PWD = os.getenv("MINIO_PWD")
@@ -1537,6 +2572,7 @@ async def lifespan(app: FastAPI):
         tg_task = asyncio.create_task(dp.start_polling(bot))
     
     vk_task = asyncio.create_task(start_vk_bot())
+    ai_task = asyncio.create_task(_ai_auto_refresh_loop())
     
     yield
     
@@ -1550,6 +2586,12 @@ async def lifespan(app: FastAPI):
     vk_task.cancel()
     try:
         await vk_task
+    except asyncio.CancelledError:
+        pass
+
+    ai_task.cancel()
+    try:
+        await ai_task
     except asyncio.CancelledError:
         pass
 
@@ -1960,6 +3002,214 @@ async def sync_vk_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool
     
     return result
 
+
+# ================== API Аналитики диалогов ==================
+
+class AssignChatRequest(BaseModel):
+    manager_id: int
+    manager_name: str
+
+@app.post("/api/chats/{chat_id}/assign")
+async def assign_chat_endpoint(
+    chat_id: int, 
+    data: AssignChatRequest, 
+    db: AsyncSession = Depends(get_db), 
+    _: bool = Depends(auth.require_auth)
+):
+    """
+    Назначает диалог менеджеру (кнопка 'Взять диалог').
+    После назначения диалог готов к отслеживанию для аналитики.
+    """
+    result = await assign_chat_to_manager(db, chat_id, data.manager_id, data.manager_name)
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    if result.get("error") == "already_assigned":
+        raise HTTPException(
+            status_code=409, 
+            detail=f"Dialog already assigned to {result.get('assigned_to')}"
+        )
+    
+    # Отправляем обновление через WebSocket
+    update_message = {
+        "type": "chat_assigned",
+        "chatId": str(chat_id),
+        "manager_id": data.manager_id,
+        "manager_name": data.manager_name,
+        "assigned_at": result.get("assigned_at")
+    }
+    await updates_manager.broadcast(json.dumps(update_message))
+    
+    return result
+
+
+@app.post("/api/chats/{chat_id}/close")
+async def close_chat_endpoint(
+    chat_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    """
+    Закрывает диалог и запускает AI-аналитику.
+    Анализирует всю переписку и сохраняет результаты.
+    """
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    
+    # Получаем все сообщения диалога
+    messages = await get_chat_messages(db, chat_id, limit=1000)
+    
+    if not messages:
+        raise HTTPException(status_code=400, detail="No messages in dialog")
+    
+    # Запускаем AI-анализ
+    analysis_result = await _ai_analyze_dialog(messages, chat.assigned_manager_name)
+    
+    # Закрываем диалог
+    close_result = await close_chat_dialog(db, chat_id)
+    
+    if analysis_result:
+        # Вычисляем длительность диалога
+        duration_minutes = None
+        if len(messages) >= 2:
+            try:
+                first_ts = messages[0].get("timestamp")
+                last_ts = messages[-1].get("timestamp")
+                if first_ts and last_ts:
+                    from datetime import datetime as dt
+                    first_dt = dt.fromisoformat(first_ts.replace('Z', '+00:00')) if isinstance(first_ts, str) else first_ts
+                    last_dt = dt.fromisoformat(last_ts.replace('Z', '+00:00')) if isinstance(last_ts, str) else last_ts
+                    duration_minutes = int((last_dt - first_dt).total_seconds() / 60)
+            except Exception:
+                pass
+        
+        # Сохраняем аналитику в БД
+        analytics_data = {
+            "chat_id": chat_id,
+            "manager_id": chat.assigned_manager_id,
+            "manager_name": chat.assigned_manager_name,
+            "channel": chat.messager,
+            "summary": analysis_result.get("summary"),
+            "customer_problem": analysis_result.get("customer_problem"),
+            "customer_intent": analysis_result.get("customer_intent"),
+            "refund_reason": analysis_result.get("refund_reason"),
+            "manager_quality_score": analysis_result.get("manager_quality_score"),
+            "manager_quality_notes": analysis_result.get("manager_quality_notes"),
+            "customer_sentiment": analysis_result.get("customer_sentiment"),
+            "resolution_status": analysis_result.get("resolution_status"),
+            "key_topics": analysis_result.get("key_topics", []),
+            "recommendations": analysis_result.get("recommendations"),
+            "messages_count": len(messages),
+            "dialog_duration_minutes": duration_minutes,
+            "raw_ai_response": analysis_result.get("raw_response")
+        }
+        
+        try:
+            analytics = await create_dialog_analytics(db, analytics_data)
+            
+            # Отправляем обновление через WebSocket
+            update_message = {
+                "type": "dialog_closed",
+                "chatId": str(chat_id),
+                "analytics_id": analytics.id,
+                "summary": analysis_result.get("summary"),
+                "manager_quality_score": analysis_result.get("manager_quality_score")
+            }
+            await updates_manager.broadcast(json.dumps(update_message))
+            
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "status": "closed",
+                "analytics": {
+                    "id": analytics.id,
+                    "summary": analytics.summary,
+                    "customer_problem": analytics.customer_problem,
+                    "customer_intent": analytics.customer_intent,
+                    "manager_quality_score": analytics.manager_quality_score,
+                    "customer_sentiment": analytics.customer_sentiment
+                }
+            }
+        except Exception as e:
+            logging.error(f"Failed to save analytics: {e}")
+            return {
+                "success": True,
+                "chat_id": chat_id,
+                "status": "closed",
+                "analytics": None,
+                "error": "Failed to save analytics"
+            }
+    
+    return {
+        "success": True,
+        "chat_id": chat_id,
+        "status": "closed",
+        "analytics": None,
+        "error": "AI analysis failed"
+    }
+
+
+@app.get("/api/chats/{chat_id}/analytics")
+async def get_chat_analytics_endpoint(
+    chat_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    """Получает аналитику для конкретного диалога"""
+    analytics = await get_dialog_analytics(db, chat_id)
+    
+    if not analytics:
+        raise HTTPException(status_code=404, detail="Analytics not found for this chat")
+    
+    return {
+        "id": analytics.id,
+        "chat_id": analytics.chat_id,
+        "manager_name": analytics.manager_name,
+        "channel": analytics.channel,
+        "summary": analytics.summary,
+        "customer_problem": analytics.customer_problem,
+        "customer_intent": analytics.customer_intent,
+        "refund_reason": analytics.refund_reason,
+        "manager_quality_score": analytics.manager_quality_score,
+        "manager_quality_notes": analytics.manager_quality_notes,
+        "customer_sentiment": analytics.customer_sentiment,
+        "resolution_status": analytics.resolution_status,
+        "key_topics": analytics.key_topics,
+        "recommendations": analytics.recommendations,
+        "messages_count": analytics.messages_count,
+        "dialog_duration_minutes": analytics.dialog_duration_minutes,
+        "created_at": analytics.created_at.isoformat() if analytics.created_at else None
+    }
+
+
+@app.get("/api/analytics")
+@limiter.limit("60/minute")
+async def get_all_analytics_endpoint(
+    request: Request,
+    page: int = 1,
+    limit: int = 50,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    """Получает список всех аналитик с пагинацией"""
+    offset = (page - 1) * limit
+    analytics_list = await get_all_analytics(db, limit, offset)
+    return analytics_list
+
+
+@app.get("/api/analytics/stats")
+@limiter.limit("60/minute")
+async def get_analytics_stats_endpoint(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    """Получает общую статистику по аналитике"""
+    return await get_analytics_stats(db)
+
+
 @app.post("/api/messages/image")
 async def upload_image(
     image: UploadFile = File(...),
@@ -2085,38 +3335,68 @@ async def upload_image(
     return {"message": db_img, "delivered": delivered, "delivery_error": delivery_error}
 
 @app.get("/api/ai/context")
-async def get_ai_context(_: bool = Depends(auth.require_auth)):
-    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
-    try:
-        async with current_session.get(API_URL) as response:
-            data = await response.json()
-            return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
-    finally:
-        if current_session != http_session: await current_session.close()
+async def get_ai_context(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    settings = await _ai_get_settings(db)
+    return {
+        "system_message": settings.get("system_message", ""),
+        "faqs": settings.get("faqs", ""),
+    }
 
 class PutAIContext(BaseModel):
-    system_message: str
-    faqs: str
+    system_message: str = ""
+    faqs: str = ""
 
 @app.put("/api/ai/context")
-async def put_ai_context(new_ai_context: PutAIContext, _: bool = Depends(auth.require_auth)):
-    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
-    try:
-        async with current_session.post(
-            API_URL,
-            json={
-                "system_message": new_ai_context.system_message,
-                "faqs": new_ai_context.faqs
-            }
-        ) as response:
-            data = await response.json()
-            return data
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка при отправке на API {e}")
-    finally:
-        if current_session != http_session: await current_session.close()
+async def put_ai_context(new_ai_context: PutAIContext, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    payload = {
+        "system_message": new_ai_context.system_message or "",
+        "faqs": new_ai_context.faqs or "",
+    }
+    await upsert_ai_settings(db, payload)
+    AI_SETTINGS_CACHE["data"] = None
+    return payload
+
+class PutAISettings(BaseModel):
+    system_message: Optional[str] = None
+    faqs: Optional[str] = None
+    rules: Optional[str] = None
+    tone: Optional[str] = None
+    handoff_phrases: Optional[str] = None
+    min_score: Optional[float] = None
+    site_pages: Optional[str] = None
+    auto_refresh_minutes: Optional[int] = None
+
+@app.get("/api/ai/settings")
+async def get_ai_settings_endpoint(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    return await _ai_get_settings(db)
+
+@app.put("/api/ai/settings")
+async def put_ai_settings_endpoint(payload: PutAISettings, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    data = {k: v for k, v in payload.dict().items() if v is not None}
+    if not data:
+        return await _ai_get_settings(db)
+    await upsert_ai_settings(db, data)
+    AI_SETTINGS_CACHE["data"] = None
+    return await _ai_get_settings(db)
+
+@app.get("/api/ai/status")
+async def get_ai_status(_: bool = Depends(auth.require_auth)):
+    return AI_STATUS
+
+@app.post("/api/ai/reindex")
+async def reindex_ai(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    return await _ai_reindex(db)
+
+@dp.message(Command("reindex"))
+async def cmd_reindex(message: Message):
+    """Команда для принудительной переиндексации базы знаний"""
+    async with async_session() as session:
+        await message.answer("🔄 Начинаю переиндексацию базы знаний...")
+        result = await _ai_reindex(session)
+        if result.get("ok"):
+            await message.answer(f"✅ База знаний обновлена! Загружено {result.get('chunks', 0)} записей.")
+        else:
+            await message.answer(f"❌ Ошибка переиндексации: {result.get('error', 'Unknown error')}")
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
@@ -2145,7 +3425,7 @@ async def cmd_menu(message: Message):
 
 @dp.message(Command("faq"))
 async def cmd_faq(message: Message):
-    await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
+    await message.answer(_tg_faq_text(1), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("m:"))
 async def handle_menu_callback(callback: types.CallbackQuery):
@@ -2169,11 +3449,11 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             return
         if action == "faq":
             if len(parts) == 2:
-                await _edit_or_send(_tg_faq_text(), tg_kb_faq_menu(1))
+                await _edit_or_send(_tg_faq_text(1), tg_kb_faq_menu(1))
                 return
             if len(parts) >= 4 and parts[2] == "page" and str(parts[3]).isdigit():
                 page = int(parts[3])
-                await _edit_or_send(_tg_faq_text(), tg_kb_faq_menu(page))
+                await _edit_or_send(_tg_faq_text(page), tg_kb_faq_menu(page))
                 return
             if len(parts) >= 5 and parts[2] == "item":
                 item_id = parts[3]
@@ -2220,8 +3500,8 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             if len(parts) >= 4 and str(parts[3]).isdigit():
                 page = int(parts[3])
             limit = 8
-            items = await catalog_get_products(category_id, page=page, limit=limit)
-            if not items:
+            items_data = await catalog_get_products(category_id, page=page, limit=limit)
+            if not items_data:
                 reason = str(_catalog_cache.get("last_error") or "").strip()
                 details = f"\n<blockquote>{html.escape(reason)}</blockquote>" if reason else "\n<blockquote>Пусто или API недоступен</blockquote>"
                 await _edit_or_send(f"<b>Каталог</b>{details}", _tg_kb([[{"text": "⬅️ Назад", "data": "m:cat"}], [{"text": "🏠 Меню", "data": "m:home"}]]))
@@ -2233,6 +3513,7 @@ async def handle_menu_callback(callback: types.CallbackQuery):
 
             rows: List[List[Dict[str, str]]] = []
             row: List[Dict[str, str]] = []
+            items = items_data.get("items") or []
             for p in items:
                 row.append({"text": str(p.get("name") or "Товар")[:28], "data": f"m:prod:{p['id']}"})
                 if len(row) == 2:
@@ -2244,7 +3525,7 @@ async def handle_menu_callback(callback: types.CallbackQuery):
             nav_row: List[Dict[str, str]] = []
             if page > 1:
                 nav_row.append({"text": "⬅️", "data": f"m:cat:{category_id}:{page-1}"})
-            if len(items) >= limit:
+            if items_data.get("has_next"):
                 nav_row.append({"text": "➡️", "data": f"m:cat:{category_id}:{page+1}"})
             if nav_row:
                 rows.append(nav_row)
@@ -2394,10 +3675,13 @@ async def handle_menu_callback(callback: types.CallbackQuery):
         state["mode"] = "ask_ai_product"
         state["product"] = {
             "id": product.get("id"),
+            "base_id": product.get("base_id"),
             "name": product.get("name"),
             "description": product.get("description"),
             "colors": product.get("colors", []),
             "url": product.get("url"),
+            "price": product.get("price"),
+            "categories": product.get("categories", []),
         }
         await callback.message.answer("Напишите вопрос по этому товару — я отвечу с учётом описания и цветов.", reply_markup=tg_kb_main())
         return
@@ -2496,7 +3780,7 @@ async def handle_message(message: Message):
             await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
             return
         if text_norm in {"faq", "/faq"}:
-            await message.answer(_tg_faq_text(), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
+            await message.answer(_tg_faq_text(1), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
             return
         if text_norm in {"каталог", "товары", "товар"}:
             categories = await catalog_get_categories()
@@ -2522,12 +3806,25 @@ async def handle_message(message: Message):
 
         force_manager = "позови менеджера" in text_norm or text_norm == "менеджер"
         state = _get_state("tg", str(message.chat.id))
-        ai_question = message.text
+        extra_context = None
+        product_id = None
+        categories: List[str] = []
         force_ai = False
         if state.get("mode") == "ask_ai_product" and state.get("product"):
             p = state["product"]
-            context = f"Контекст товара:\nНазвание: {p.get('name','')}\nОписание: {p.get('description','')}\nЦвета: {', '.join(p.get('colors', []))}\nСсылка: {p.get('url','')}"
-            ai_question = f"{context}\n\nВопрос пользователя: {message.text}"
+            product_id = str(p.get("base_id") or p.get("id") or "")
+            categories = p.get("categories") or []
+            if not categories and product_id:
+                categories = await catalog_get_product_categories(product_id)
+            price_text = _format_price(p.get("price"))
+            extra_context = (
+                f"Контекст товара:\nНазвание: {p.get('name','')}\n"
+                f"Описание: {p.get('description','')}\n"
+                f"Цена: {price_text}\n"
+                f"Цвета: {', '.join(p.get('colors', []))}\n"
+                f"Категории: {', '.join(categories)}\n"
+                f"Ссылка: {p.get('url','')}"
+            )
             _clear_state("tg", str(message.chat.id))
             force_ai = True
 
@@ -2573,84 +3870,69 @@ async def handle_message(message: Message):
             return
 
         if not chat.ai and not force_ai:
-            await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
-            update_message = {
-                "type": "chat_update",
-                "chat_id": chat.id,
-                "waiting": True
-            }
-            await updates_manager.broadcast(json.dumps(update_message))
-            
-            notification_manager = notifications.get_notification_manager()
-            if notification_manager:
-                await notification_manager.send_waiting_notification(
-                    chat_id=message.chat.id,
-                    chat_name=message.chat.first_name or str(message.chat.id),
-                    messager="telegram"
-                )
-            return
-        
-        current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
-        try:
-            async with current_session.post(
-                API_URL,
-                json={
-                    "question": ai_question,
-                    "chat_id": chat.id
+            if chat.waiting:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=False)
+                update_message = {
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": False
                 }
-            ) as response:
-                if response.status != 200:
-                    await message.answer("Извините, произошла ошибка при обработке запроса")
-                data = await response.json()
-                if not data:
-                    await message.answer("Извините, произошла ошибка при обработке запроса")
-                if "answer" in data:
-                    answer = data["answer"]
-                    await message.answer(answer)
-                    new_answer = crud.Message(
-                        chat_id=chat.id,
-                        message=answer,
-                        message_type="answer",
-                        ai=True,
-                        created_at=datetime.utcnow()
-                    )
-                    session.add(new_answer)
-                    await session.commit()
-                    await session.refresh(new_answer)
-                    message_for_frontend = {
-                        "type": "message",
-                        "chatId": chat.id,
-                        "content": answer,
-                        "message_type": "answer",
-                        "ai": True,
-                        "timestamp": new_answer.created_at.isoformat(),
-                        "id": new_answer.id
-                    }
-                    await messages_manager.broadcast(json.dumps(message_for_frontend))
-                if "manager" in data and data["manager"] == "true":
-                    await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
-                    await update_chat_ai(db=session, chat_id=chat.id, ai=False)
-                    update_message = {
-                        "type": "chat_update",
-                        "chat_id": chat.id,
-                        "waiting": True,
-                        "ai": False
-                    }
-                    await updates_manager.broadcast(json.dumps(update_message))
-                    
-                    notification_manager = notifications.get_notification_manager()
-                    if notification_manager:
-                        await notification_manager.send_waiting_notification(
-                            chat_id=message.chat.id,
-                            chat_name=message.chat.first_name or str(message.chat.id),
-                            messager="telegram"
-                        )
+                await updates_manager.broadcast(json.dumps(update_message))
+            await update_chat_ai(db=session, chat_id=chat.id, ai=True)
+            chat.ai = True
+        
+        try:
+            history = await get_chat_messages(session, chat.id, limit=6)
+            history_text = _ai_build_history(history, max_items=6)
+            ai_result = await _ai_answer_question(
+                session,
+                message.text,
+                extra_context=extra_context,
+                product_id=product_id,
+                product_categories=categories or None,
+                conversation_history=history_text,
+                previous_user_message=_ai_get_previous_user_message(history, message.text),
+            )
+            if ai_result.get("handoff"):
+                reason = ai_result.get("reason")
+                if reason in {"user_request", "orders"}:
+                    await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+                    await message.answer(_ai_handoff_reply(reason), reply_markup=tg_kb_main())
+                    return
+                await message.answer(_ai_soft_refusal_reply(), reply_markup=tg_kb_main())
+                return
+
+            answer = str(ai_result.get("answer") or "").strip()
+            answer = _normalize_price_text(answer)
+            if not answer:
+                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+                await message.answer(_ai_handoff_reply(ai_result.get("reason")), reply_markup=tg_kb_main())
+                return
+
+            await message.answer(answer)
+            new_answer = crud.Message(
+                chat_id=chat.id,
+                message=answer,
+                message_type="answer",
+                ai=True,
+                created_at=datetime.utcnow()
+            )
+            session.add(new_answer)
+            await session.commit()
+            await session.refresh(new_answer)
+            message_for_frontend = {
+                "type": "message",
+                "chatId": chat.id,
+                "content": answer,
+                "message_type": "answer",
+                "ai": True,
+                "timestamp": new_answer.created_at.isoformat(),
+                "id": new_answer.id
+            }
+            await messages_manager.broadcast(json.dumps(message_for_frontend))
         except Exception as e:
             logging.error(f"Error processing message: {e}")
             await message.answer("Извините, произошла ошибка при обработке запроса")
-        finally:
-            if current_session != http_session:
-                await current_session.close()
 
 
 @dp.message(F.photo)

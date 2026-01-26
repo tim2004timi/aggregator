@@ -1,5 +1,3 @@
---- Core Knowledge  – FAQ Answers (Use exactly as written for direct FAQ matches) ---
-
 Q: Delivery Time? (Когда ожидать доставку?)
 A: Срок зависит от того, в наличии ли вещь или на предзаказе. Если в наличии — отправка на следующий день, если нет — сроки производства и отправки устанавливаются брендом. Точные сроки по предзаказу можно узнать у менеджера. Хотите, чтобы я связал вас с ним?
 EN: Delivery time depends on whether the item is in stock or a pre-order. In-stock items usually ship the next day. Pre-order items have custom timelines set by us. Ask the manager via social media for specific timing.

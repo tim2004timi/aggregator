@@ -161,10 +161,15 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } else if (data.type === 'chat_created' && data.chat) {
         const newChat = data.chat;
 
-        setChats(prevChats => [
-          newChat,
-          ...prevChats,
-        ]);
+        setChats(prevChats => {
+          const exists = prevChats.some(chat => String(chat.id) === String(newChat.id));
+          if (exists) {
+            return prevChats.map(chat =>
+              String(chat.id) === String(newChat.id) ? { ...chat, ...newChat } : chat
+            );
+          }
+          return [newChat, ...prevChats];
+        });
 
         fetchStats();
       } else if (data.type === 'chat_update') {

@@ -1,11 +1,12 @@
 import os
+import re
 import asyncio
 import io
 import aiohttp
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, selectinload
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select, desc, ARRAY, delete
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, DateTime, func, select, desc, ARRAY, delete, JSON, Float
 from sqlalchemy.exc import SQLAlchemyError
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -46,7 +47,13 @@ class Chat(Base):
     tags = Column(ARRAY(String), default=[])
     name = Column(String(30), default="Не известно")
     messager = Column(String(16), nullable=False, default="telegram")
+    # Поля для аналитики и назначения менеджера
+    assigned_manager_id = Column(Integer, nullable=True)
+    assigned_manager_name = Column(String(100), nullable=True)
+    assigned_at = Column(DateTime(timezone=True), nullable=True)
+    dialog_status = Column(String(20), default="new")  # new, assigned, closed
     messages = relationship("Message", back_populates="chat")
+    analytics = relationship("DialogAnalytics", back_populates="chat", uselist=False)
 
 class Message(Base):
     __tablename__ = "messages"
@@ -58,6 +65,57 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
     is_image = Column(Boolean, default=False)
     chat = relationship("Chat", back_populates="messages")
+
+class AiSettings(Base):
+    __tablename__ = "ai_settings"
+    id = Column(Integer, primary_key=True, index=True)
+    system_message = Column(String, default="")
+    faqs = Column(String, default="")
+    rules = Column(String, default="")
+    tone = Column(String, default="")
+    handoff_phrases = Column(String, default="")
+    min_score = Column(Float, default=0.2)
+    site_pages = Column(String, default="")
+    auto_refresh_minutes = Column(Integer, default=0)
+    updated_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()), onupdate=func.timezone('UTC', func.now()))
+
+class AiKnowledge(Base):
+    __tablename__ = "ai_knowledge"
+    id = Column(Integer, primary_key=True, index=True)
+    data = Column(JSON, nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()), onupdate=func.timezone('UTC', func.now()))
+
+
+class DialogAnalytics(Base):
+    """Модель для хранения AI-аналитики диалогов"""
+    __tablename__ = "dialog_analytics"
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), nullable=False, unique=True, index=True)
+    
+    # Основная информация
+    manager_id = Column(Integer, nullable=True)
+    manager_name = Column(String(100), nullable=True)
+    channel = Column(String(20), nullable=True)  # telegram, vk, whatsapp
+    
+    # Результаты AI-анализа
+    summary = Column(String, nullable=True)  # Краткое резюме диалога
+    customer_problem = Column(String, nullable=True)  # Проблема клиента
+    customer_intent = Column(String, nullable=True)  # Намерение клиента (покупка, возврат, вопрос)
+    refund_reason = Column(String, nullable=True)  # Причина возврата если есть
+    manager_quality_score = Column(Integer, nullable=True)  # Оценка качества работы менеджера 1-10
+    manager_quality_notes = Column(String, nullable=True)  # Комментарии к оценке
+    customer_sentiment = Column(String, nullable=True)  # Настроение клиента (positive, neutral, negative)
+    resolution_status = Column(String, nullable=True)  # Статус решения (resolved, pending, escalated)
+    key_topics = Column(ARRAY(String), default=[])  # Ключевые темы диалога
+    recommendations = Column(String, nullable=True)  # Рекомендации для бизнеса
+    
+    # Метаданные
+    messages_count = Column(Integer, default=0)
+    dialog_duration_minutes = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
+    raw_ai_response = Column(JSON, nullable=True)  # Полный ответ AI для отладки
+    
+    chat = relationship("Chat", back_populates="analytics")
 
 
 # CRUD operations
@@ -127,6 +185,44 @@ async def update_chat_ai(db: AsyncSession, chat_id: int, ai: bool):
         await db.refresh(chat)
     return chat
 
+async def get_ai_settings(db: AsyncSession) -> Optional[AiSettings]:
+    result = await db.execute(select(AiSettings).limit(1))
+    return result.scalar_one_or_none()
+
+async def upsert_ai_settings(db: AsyncSession, payload: Dict[str, Any]) -> AiSettings:
+    settings = await get_ai_settings(db)
+    if not settings:
+        settings = AiSettings(**payload)
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+        return settings
+
+    for key, value in payload.items():
+        if hasattr(settings, key):
+            setattr(settings, key, value)
+    await db.commit()
+    await db.refresh(settings)
+    return settings
+
+async def get_ai_knowledge(db: AsyncSession) -> Optional[AiKnowledge]:
+    result = await db.execute(select(AiKnowledge).limit(1))
+    return result.scalar_one_or_none()
+
+async def save_ai_knowledge(db: AsyncSession, data: Any) -> AiKnowledge:
+    knowledge = await get_ai_knowledge(db)
+    if not knowledge:
+        knowledge = AiKnowledge(data=data)
+        db.add(knowledge)
+        await db.commit()
+        await db.refresh(knowledge)
+        return knowledge
+
+    knowledge.data = data
+    await db.commit()
+    await db.refresh(knowledge)
+    return knowledge
+
 async def get_stats(db: AsyncSession):
     total = await db.scalar(select(func.count(Chat.id)))
     pending = await db.scalar(select(func.count(Chat.id)).filter(Chat.waiting == True))
@@ -168,6 +264,10 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
             "name": chat.name,
             "tags": chat.tags,
             "messager": chat.messager,
+            "assigned_manager_id": chat.assigned_manager_id,
+            "assigned_manager_name": chat.assigned_manager_name,
+            "assigned_at": chat.assigned_at.isoformat() if chat.assigned_at else None,
+            "dialog_status": chat.dialog_status,
             "last_message": None
         }
         
@@ -267,7 +367,7 @@ async def sync_vk(db: AsyncSession, chat_id: int) -> dict:
     try:
         # Инициализируем VK API
         VK_TOKEN = os.getenv("VK_TOKEN")
-        VK_GROUP_ID = int(os.getenv("VK_GROUP_ID", "0"))
+        VK_GROUP_ID = int(re.sub(r"\D", "", os.getenv("VK_GROUP_ID", "0")))
         
         if not VK_TOKEN:
             return {"success": False, "message": "VK_TOKEN not found"}
@@ -474,3 +574,135 @@ async def sync_vk(db: AsyncSession, chat_id: int) -> dict:
     except Exception as e:
         await db.rollback()
         return {"success": False, "message": f"Error during synchronization: {str(e)}"}
+
+
+# ================== Аналитика диалогов ==================
+
+async def assign_chat_to_manager(db: AsyncSession, chat_id: int, manager_id: int, manager_name: str) -> Optional[Dict[str, Any]]:
+    """Назначает диалог менеджеру (кнопка 'Взять диалог')"""
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        return None
+    
+    # Если диалог уже назначен другому менеджеру
+    if chat.assigned_manager_id and chat.assigned_manager_id != manager_id:
+        return {"error": "already_assigned", "assigned_to": chat.assigned_manager_name}
+    
+    chat.assigned_manager_id = manager_id
+    chat.assigned_manager_name = manager_name
+    chat.assigned_at = datetime.utcnow()
+    chat.dialog_status = "assigned"
+    
+    await db.commit()
+    await db.refresh(chat)
+    
+    return {
+        "success": True,
+        "chat_id": chat.id,
+        "manager_id": manager_id,
+        "manager_name": manager_name,
+        "assigned_at": chat.assigned_at.isoformat() if chat.assigned_at else None
+    }
+
+
+async def close_chat_dialog(db: AsyncSession, chat_id: int) -> Optional[Dict[str, Any]]:
+    """Закрывает диалог (меняет статус на closed)"""
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        return None
+    
+    chat.dialog_status = "closed"
+    await db.commit()
+    await db.refresh(chat)
+    
+    return {"success": True, "chat_id": chat.id, "status": "closed"}
+
+
+async def create_dialog_analytics(db: AsyncSession, analytics_data: Dict[str, Any]) -> DialogAnalytics:
+    """Создает запись аналитики для диалога"""
+    analytics = DialogAnalytics(**analytics_data)
+    db.add(analytics)
+    try:
+        await db.commit()
+        await db.refresh(analytics)
+        return analytics
+    except SQLAlchemyError:
+        await db.rollback()
+        raise
+
+
+async def get_dialog_analytics(db: AsyncSession, chat_id: int) -> Optional[DialogAnalytics]:
+    """Получает аналитику для конкретного диалога"""
+    result = await db.execute(
+        select(DialogAnalytics).filter(DialogAnalytics.chat_id == chat_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def get_all_analytics(db: AsyncSession, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+    """Получает список всех аналитик с пагинацией"""
+    query = (
+        select(DialogAnalytics, Chat)
+        .join(Chat, DialogAnalytics.chat_id == Chat.id)
+        .order_by(desc(DialogAnalytics.created_at))
+        .limit(limit)
+        .offset(offset)
+    )
+    
+    result = await db.execute(query)
+    rows = result.all()
+    
+    analytics_list = []
+    for analytics, chat in rows:
+        analytics_list.append({
+            "id": analytics.id,
+            "chat_id": analytics.chat_id,
+            "chat_name": chat.name,
+            "channel": analytics.channel,
+            "manager_name": analytics.manager_name,
+            "summary": analytics.summary,
+            "customer_problem": analytics.customer_problem,
+            "customer_intent": analytics.customer_intent,
+            "refund_reason": analytics.refund_reason,
+            "manager_quality_score": analytics.manager_quality_score,
+            "customer_sentiment": analytics.customer_sentiment,
+            "resolution_status": analytics.resolution_status,
+            "key_topics": analytics.key_topics,
+            "messages_count": analytics.messages_count,
+            "created_at": analytics.created_at.isoformat() if analytics.created_at else None
+        })
+    
+    return analytics_list
+
+
+async def get_analytics_stats(db: AsyncSession) -> Dict[str, Any]:
+    """Получает общую статистику по аналитике"""
+    total = await db.scalar(select(func.count(DialogAnalytics.id)))
+    avg_score = await db.scalar(select(func.avg(DialogAnalytics.manager_quality_score)))
+    
+    # Подсчет по настроению клиентов
+    positive = await db.scalar(
+        select(func.count(DialogAnalytics.id)).filter(DialogAnalytics.customer_sentiment == "positive")
+    )
+    negative = await db.scalar(
+        select(func.count(DialogAnalytics.id)).filter(DialogAnalytics.customer_sentiment == "negative")
+    )
+    neutral = await db.scalar(
+        select(func.count(DialogAnalytics.id)).filter(DialogAnalytics.customer_sentiment == "neutral")
+    )
+    
+    # Подсчет возвратов
+    refunds = await db.scalar(
+        select(func.count(DialogAnalytics.id)).filter(DialogAnalytics.refund_reason.isnot(None))
+    )
+    
+    return {
+        "total_analyzed": total or 0,
+        "avg_manager_score": round(float(avg_score), 2) if avg_score else None,
+        "sentiment": {
+            "positive": positive or 0,
+            "neutral": neutral or 0,
+            "negative": negative or 0
+        },
+        "refunds_count": refunds or 0
+    }

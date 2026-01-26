@@ -425,6 +425,79 @@ export const putAiContext = async (system_message: string, faqs: string): Promis
   }
 };
 
+export interface AiSettings {
+  system_message: string;
+  faqs: string;
+  rules: string;
+  tone: string;
+  handoff_phrases: string;
+  min_score: number;
+  site_pages: string;
+  auto_refresh_minutes: number;
+}
+
+export const getAiSettings = async (): Promise<AiSettings> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/ai/settings`);
+  if (!response.ok) {
+    throw new Error('Failed to fetch AI settings');
+  }
+  const data = await response.json();
+  return {
+    system_message: data.system_message || '',
+    faqs: data.faqs || '',
+    rules: data.rules || '',
+    tone: data.tone || '',
+    handoff_phrases: data.handoff_phrases || '',
+    min_score: typeof data.min_score === 'number' ? data.min_score : 0.2,
+    site_pages: data.site_pages || '',
+    auto_refresh_minutes: typeof data.auto_refresh_minutes === 'number' ? data.auto_refresh_minutes : 0,
+  };
+};
+
+export const putAiSettings = async (payload: Partial<AiSettings>): Promise<AiSettings> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/ai/settings`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(errorData.detail || 'Failed to update AI settings');
+  }
+  const data = await response.json();
+  return {
+    system_message: data.system_message || '',
+    faqs: data.faqs || '',
+    rules: data.rules || '',
+    tone: data.tone || '',
+    handoff_phrases: data.handoff_phrases || '',
+    min_score: typeof data.min_score === 'number' ? data.min_score : 0.2,
+    site_pages: data.site_pages || '',
+    auto_refresh_minutes: typeof data.auto_refresh_minutes === 'number' ? data.auto_refresh_minutes : 0,
+  };
+};
+
+export const reindexAi = async (): Promise<{ ok: boolean; chunks?: number; error?: string }> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/ai/reindex`, {
+    method: 'POST',
+    headers: getAuthHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to reindex AI knowledge');
+  }
+  return response.json();
+};
+
+export const getAiStatus = async (): Promise<{ last_indexed?: string; last_error?: string; chunks?: number }> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/ai/status`, {
+    headers: getAuthHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to fetch AI status');
+  }
+  return response.json();
+};
+
 // Sync VK chat
 export const syncVkChat = async (chatId: number): Promise<{ success: boolean; message: string; vk_count?: number; db_count_before?: number; db_count_after?: number }> => {
   try {
