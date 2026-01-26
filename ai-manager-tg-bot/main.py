@@ -2318,7 +2318,7 @@ async def handle_single_event(event):
             _clear_state("vk", str(peer_id))
         history = await get_chat_messages(session, chat.id, limit=6)
         history_text = _ai_build_history(history, max_items=6)
-            previous_user_message = _ai_get_previous_user_message(history, text)
+        previous_user_message = _ai_get_previous_user_message(history, text)
         ai_result = await _ai_answer_question(
             session,
             text,
@@ -2326,7 +2326,7 @@ async def handle_single_event(event):
             product_id=product_id,
             product_categories=categories or None,
             conversation_history=history_text,
-                previous_user_message=previous_user_message,
+            previous_user_message=previous_user_message,
         )
         if ai_result.get("handoff"):
             reason = ai_result.get("reason")
