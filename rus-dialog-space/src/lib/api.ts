@@ -519,3 +519,103 @@ export const syncVkChat = async (chatId: number): Promise<{ success: boolean; me
     throw error;
   }
 };
+
+// Analytics types
+export interface DialogAnalytics {
+  id: number;
+  chat_id: number;
+  manager_id?: number;
+  manager_name?: string;
+  channel?: string;
+  summary?: string;
+  customer_problem?: string;
+  customer_intent?: string;
+  refund_reason?: string;
+  manager_quality_score?: number;
+  manager_quality_notes?: string;
+  customer_sentiment?: string;
+  resolution_status?: string;
+  key_topics?: string[];
+  recommendations?: string;
+  messages_count?: number;
+  dialog_duration_minutes?: number;
+  created_at: string;
+}
+
+// Analyze chat (close dialog and create analytics)
+export const analyzeChat = async (chatId: number, managerName?: string): Promise<DialogAnalytics> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/chats/${chatId}/close`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({ manager_name: managerName }),
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || 'Failed to analyze chat');
+    }
+    
+    const data = await response.json();
+    toast.success('Чат проанализирован');
+    return data.analytics;
+  } catch (error) {
+    console.error('Error analyzing chat:', error);
+    toast.error('Не удалось проанализировать чат');
+    throw error;
+  }
+};
+
+// Get analytics for a chat
+export const getChatAnalytics = async (chatId: number): Promise<DialogAnalytics | null> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/chats/${chatId}/analytics`);
+    if (!response.ok) {
+      if (response.status === 404) return null;
+      throw new Error('Failed to fetch analytics');
+    }
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching chat analytics:', error);
+    return null;
+  }
+};
+
+// Get all analytics
+export const getAllAnalytics = async (): Promise<DialogAnalytics[]> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/analytics`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch analytics');
+    }
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching all analytics:', error);
+    toast.error('Не удалось загрузить аналитику');
+    return [];
+  }
+};
+
+// Get analytics stats
+export const getAnalyticsStats = async (): Promise<{
+  total_dialogs: number;
+  avg_quality_score: number;
+  sentiment_distribution: Record<string, number>;
+  resolution_distribution: Record<string, number>;
+}> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/analytics/stats`);
+    if (!response.ok) {
+      throw new Error('Failed to fetch analytics stats');
+    }
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching analytics stats:', error);
+    return {
+      total_dialogs: 0,
+      avg_quality_score: 0,
+      sentiment_distribution: {},
+      resolution_distribution: {},
+    };
+  }
+};

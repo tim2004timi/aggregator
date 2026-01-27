@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getChatStats } from '@/lib/api';
-import { MessageSquare, CircleDot, Settings, Bot } from 'lucide-react';
+import { MessageSquare, CircleDot, Settings, Bot, BarChart3 } from 'lucide-react';
 import { useWebSocket } from '@/contexts/WebSocketContext';
 import { Button } from '@/components/ui/button';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -76,20 +76,31 @@ const ChatStats = () => {
               <p className="text-sm font-medium">{stats.ai}</p>
             </div>
           </div>
-          <div className="ml-auto">
+          <div className="ml-auto flex gap-2">
             <Button
               variant="outline"
               size="icon"
               onClick={() => navigate(location.pathname === '/ai-chats' ? '/' : '/ai-chats')}
-              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 mr-2 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
+              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
+              title="ИИ чаты"
             >
               <Bot size={20} />
             </Button>
             <Button
               variant="outline"
               size="icon"
+              onClick={() => navigate('/analytics')}
+              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/analytics' ? 'bg-gray-100' : ''}`}
+              title="Аналитика"
+            >
+              <BarChart3 size={20} />
+            </Button>
+            <Button
+              variant="outline"
+              size="icon"
               onClick={() => navigate('/message-box')}
-              className="w-10 h-10 border-gray-300 hover:bg-gray-100"
+              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/message-box' ? 'bg-gray-100' : ''}`}
+              title="Настройки"
             >
               <Settings size={20} />
             </Button>

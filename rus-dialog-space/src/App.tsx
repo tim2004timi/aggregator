@@ -11,6 +11,7 @@ import NotFound from "./pages/NotFound";
 import MessageBox from "./pages/MessageBox";
 import Login from "./pages/Login";
 import AiChats from "./pages/AiChats";
+import Analytics from "./pages/Analytics";
 
 console.log('App module loaded');
 
@@ -100,6 +101,7 @@ const App = () => {
               <Routes>
                 <Route path="/" element={<RequireAuth><Index /></RequireAuth>} />
                 <Route path="/ai-chats" element={<RequireAuth><AiChats /></RequireAuth>} />
+                <Route path="/analytics" element={<RequireAuth><Analytics /></RequireAuth>} />
                 <Route path="/login" element={<RedirectIfAuthed><Login /></RedirectIfAuthed>} />
                 <Route path="/message-box" element={<RequireAuth><MessageBox /></RequireAuth>} />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}

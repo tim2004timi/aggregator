@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Message, Chat, getChatMessages, sendMessage as apiSendMessage, toggleAiChat, markChatAsRead, deleteChat, API_URL, fetchWithTokenRefresh, syncVkChat } from '@/lib/api';
+import { Message, Chat, getChatMessages, sendMessage as apiSendMessage, toggleAiChat, markChatAsRead, deleteChat, API_URL, fetchWithTokenRefresh, syncVkChat, analyzeChat, getChatAnalytics, DialogAnalytics } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Send, Trash2, Paperclip, ArrowDown, RotateCw } from 'lucide-react';
+import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3 } from 'lucide-react';
 import { toast } from '@/components/ui/sonner';
 import {
   AlertDialog,
@@ -38,6 +38,9 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
   const [unreadCount, setUnreadCount] = useState(0);
   const [isNearBottom, setIsNearBottom] = useState(true);
   const [isSyncing, setIsSyncing] = useState(false);
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [analytics, setAnalytics] = useState<DialogAnalytics | null>(null);
+  const [showAnalyticsDialog, setShowAnalyticsDialog] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -227,6 +230,33 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     }
   };
 
+  const handleAnalyze = async () => {
+    if (!chatId) return;
+    
+    setIsAnalyzing(true);
+    try {
+      const result = await analyzeChat(chatId);
+      setAnalytics(result);
+      setShowAnalyticsDialog(true);
+    } catch (error) {
+      console.error('Failed to analyze chat:', error);
+    } finally {
+      setIsAnalyzing(false);
+    }
+  };
+
+  const loadExistingAnalytics = useCallback(async () => {
+    if (!chatId) return;
+    const existing = await getChatAnalytics(chatId);
+    setAnalytics(existing);
+  }, [chatId]);
+
+  useEffect(() => {
+    if (chatId) {
+      loadExistingAnalytics();
+    }
+  }, [chatId, loadExistingAnalytics]);
+
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file || !selectedChat) return;
@@ -337,6 +367,19 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
               />
             </Button>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            className={`hover:bg-blue-50 ${analytics ? 'text-blue-500' : 'text-gray-500 hover:text-blue-600'}`}
+            onClick={analytics ? () => setShowAnalyticsDialog(true) : handleAnalyze}
+            disabled={isAnalyzing}
+            title={analytics ? 'Посмотреть анализ' : 'Анализировать чат'}
+          >
+            <BarChart3 
+              size={18} 
+              className={isAnalyzing ? 'animate-pulse' : ''}
+            />
+          </Button>
           <div className="flex items-center space-x-1">
             <span className="text-sm text-gray-600 hidden sm:inline">ИИ</span>
             <Switch checked={aiEnabled} onCheckedChange={handleAiToggle} />
@@ -458,6 +501,109 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Analytics Dialog */}
+      <Dialog open={showAnalyticsDialog} onOpenChange={setShowAnalyticsDialog}>
+        <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold flex items-center gap-2">
+              <BarChart3 size={24} className="text-blue-500" />
+              Анализ диалога
+            </h2>
+            
+            {analytics ? (
+              <div className="space-y-4">
+                {analytics.summary && (
+                  <div className="p-3 bg-gray-50 rounded-lg">
+                    <h3 className="font-medium text-gray-700 mb-1">Краткое содержание</h3>
+                    <p className="text-gray-600">{analytics.summary}</p>
+                  </div>
+                )}
+                
+                {analytics.customer_problem && (
+                  <div className="p-3 bg-red-50 rounded-lg">
+                    <h3 className="font-medium text-red-700 mb-1">Проблема клиента</h3>
+                    <p className="text-gray-600">{analytics.customer_problem}</p>
+                  </div>
+                )}
+
+                {analytics.customer_intent && (
+                  <div className="p-3 bg-blue-50 rounded-lg">
+                    <h3 className="font-medium text-blue-700 mb-1">Намерение клиента</h3>
+                    <p className="text-gray-600">{analytics.customer_intent}</p>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 gap-3">
+                  {analytics.customer_sentiment && (
+                    <div className="p-3 bg-gray-50 rounded-lg">
+                      <h3 className="font-medium text-gray-700 mb-1">Настроение</h3>
+                      <span className={`px-2 py-1 rounded text-sm ${
+                        analytics.customer_sentiment === 'positive' ? 'bg-green-100 text-green-700' :
+                        analytics.customer_sentiment === 'negative' ? 'bg-red-100 text-red-700' :
+                        'bg-gray-100 text-gray-700'
+                      }`}>
+                        {analytics.customer_sentiment === 'positive' ? 'Позитивное' :
+                         analytics.customer_sentiment === 'negative' ? 'Негативное' : 'Нейтральное'}
+                      </span>
+                    </div>
+                  )}
+
+                  {analytics.resolution_status && (
+                    <div className="p-3 bg-gray-50 rounded-lg">
+                      <h3 className="font-medium text-gray-700 mb-1">Статус решения</h3>
+                      <span className={`px-2 py-1 rounded text-sm ${
+                        analytics.resolution_status === 'resolved' ? 'bg-green-100 text-green-700' :
+                        analytics.resolution_status === 'pending' ? 'bg-yellow-100 text-yellow-700' :
+                        'bg-gray-100 text-gray-700'
+                      }`}>
+                        {analytics.resolution_status === 'resolved' ? 'Решено' :
+                         analytics.resolution_status === 'pending' ? 'В ожидании' : analytics.resolution_status}
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                {analytics.manager_quality_score !== undefined && (
+                  <div className="p-3 bg-purple-50 rounded-lg">
+                    <h3 className="font-medium text-purple-700 mb-1">Качество работы менеджера</h3>
+                    <div className="flex items-center gap-2">
+                      <div className="text-2xl font-bold text-purple-600">{analytics.manager_quality_score}/10</div>
+                      {analytics.manager_quality_notes && (
+                        <p className="text-gray-600 text-sm">{analytics.manager_quality_notes}</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {analytics.key_topics && analytics.key_topics.length > 0 && (
+                  <div className="p-3 bg-gray-50 rounded-lg">
+                    <h3 className="font-medium text-gray-700 mb-2">Ключевые темы</h3>
+                    <div className="flex flex-wrap gap-2">
+                      {analytics.key_topics.map((topic, i) => (
+                        <span key={i} className="px-2 py-1 bg-gray-200 rounded text-sm">{topic}</span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {analytics.recommendations && (
+                  <div className="p-3 bg-green-50 rounded-lg">
+                    <h3 className="font-medium text-green-700 mb-1">Рекомендации</h3>
+                    <p className="text-gray-600">{analytics.recommendations}</p>
+                  </div>
+                )}
+
+                <div className="text-xs text-gray-400 pt-2">
+                  Создано: {new Date(analytics.created_at).toLocaleString('ru-RU')}
+                </div>
+              </div>
+            ) : (
+              <p className="text-gray-500">Нет данных анализа</p>
+            )}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };
