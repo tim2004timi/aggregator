@@ -46,63 +46,66 @@ const ChatStats = () => {
   }, [lastUpdate]);
 
   return (
-    <div className="bg-white border-b border-gray-300 py-3 px-4 flex items-center h-14">
+    <div className="bg-white border-b border-gray-300 py-3 px-4 flex items-center h-14 sm:h-auto min-h-14">
       {loading ? (
         <div className="text-sm text-gray-500">Загрузка статистики...</div>
       ) : (
-        <div className="flex space-x-6 w-full">
-          <div className="flex items-center">
-            <MessageSquare size={18} className="text-gray-500 mr-2" />
-            <div>
-              <p className="text-xs text-gray-500">Всего чатов</p>
-              <p className="text-sm font-medium">{stats.total}</p>
+        <div className="flex flex-row items-center justify-between w-full gap-2 sm:gap-4 overflow-x-auto no-scrollbar">
+          <div className="flex items-center space-x-4 sm:space-x-6">
+            <div className="flex items-center flex-shrink-0">
+              <MessageSquare size={18} className="text-gray-500 mr-2" />
+              <div>
+                <p className="text-[10px] sm:text-xs text-gray-500 leading-none">Всего</p>
+                <p className="text-xs sm:text-sm font-medium">{stats.total}</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center flex-shrink-0">
+              <CircleDot size={18} className="text-unread mr-2" />
+              <div>
+                <p className="text-[10px] sm:text-xs text-gray-500 leading-none">Ждут</p>
+                <p className="text-xs sm:text-sm font-medium">{stats.pending}</p>
+              </div>
+            </div>
+            
+            <div className="flex items-center flex-shrink-0">
+              <div className="w-4 h-4 bg-aiHighlight/20 rounded-sm flex items-center justify-center text-aiHighlight text-[10px] font-bold mr-2">
+                A
+              </div>
+              <div>
+                <p className="text-[10px] sm:text-xs text-gray-500 leading-none">ИИ</p>
+                <p className="text-xs sm:text-sm font-medium">{stats.ai}</p>
+              </div>
             </div>
           </div>
-          
-          <div className="flex items-center">
-            <CircleDot size={18} className="text-unread mr-2" />
-            <div>
-              <p className="text-xs text-gray-500">Ожидают ответа</p>
-              <p className="text-sm font-medium">{stats.pending}</p>
-            </div>
-          </div>
-          
-          <div className="flex items-center">
-            <div className="w-4 h-4 bg-aiHighlight/20 rounded-sm flex items-center justify-center text-aiHighlight text-xs font-bold mr-2">
-              A
-            </div>
-            <div>
-              <p className="text-xs text-gray-500">ИИ чаты</p>
-              <p className="text-sm font-medium">{stats.ai}</p>
-            </div>
-          </div>
-          <div className="ml-auto flex gap-2">
+
+          <div className="flex gap-1 sm:gap-2 flex-shrink-0">
             <Button
               variant="outline"
               size="icon"
               onClick={() => navigate(location.pathname === '/ai-chats' ? '/' : '/ai-chats')}
-              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
+              className={`w-8 h-8 sm:w-10 sm:h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/ai-chats' ? 'bg-gray-100' : ''}`}
               title="ИИ чаты"
             >
-              <Bot size={20} />
+              <Bot size={18} className="sm:size-20" />
             </Button>
             <Button
               variant="outline"
               size="icon"
               onClick={() => navigate('/analytics')}
-              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/analytics' ? 'bg-gray-100' : ''}`}
+              className={`w-8 h-8 sm:w-10 sm:h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/analytics' ? 'bg-gray-100' : ''}`}
               title="Аналитика"
             >
-              <BarChart3 size={20} />
+              <BarChart3 size={18} className="sm:size-20" />
             </Button>
             <Button
               variant="outline"
               size="icon"
               onClick={() => navigate('/message-box')}
-              className={`w-10 h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/message-box' ? 'bg-gray-100' : ''}`}
+              className={`w-8 h-8 sm:w-10 sm:h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/message-box' ? 'bg-gray-100' : ''}`}
               title="Настройки"
             >
-              <Settings size={20} />
+              <Settings size={18} className="sm:size-20" />
             </Button>
           </div>
         </div>

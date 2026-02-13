@@ -99,6 +99,29 @@ export const login = async (email: string, password: string): Promise<string> =>
   }
 };
 
+// Register new manager account
+export const register = async (email: string, password: string, name: string): Promise<void> => {
+  try {
+    const response = await fetch(`${config.authUrl}/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, password, name }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.detail || 'Ошибка при регистрации');
+    }
+
+    return;
+  } catch (error) {
+    console.error('Register error:', error);
+    throw error;
+  }
+};
+
 // Types
 export interface Chat {
   id: number;
@@ -111,6 +134,18 @@ export interface Chat {
   lastMessage?: string;
   lastMessageTime?: string;
   unread?: boolean;
+  assigned_manager_id?: number;
+  assigned_manager_name?: string;
+  dialog_status?: 'new' | 'assigned' | 'closed';
+}
+
+export interface User {
+  id: number;
+  email: string;
+  is_active: boolean;
+  is_superuser: boolean;
+  is_verified: boolean;
+  name?: string;
 }
 
 export interface Message {
@@ -122,6 +157,57 @@ export interface Message {
   ai: boolean;
   is_image: boolean;
 }
+
+// Get current user
+export const getCurrentUser = async (): Promise<User> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${config.authUrl}/me`);
+    
+    if (!response.ok) {
+      throw new Error('Failed to fetch user info');
+    }
+    
+    return await response.json();
+  } catch (error) {
+    console.error('Error fetching user info:', error);
+    throw error;
+  }
+};
+
+// Assign chat to manager
+export const assignChat = async (chatId: number, managerId: number, managerName: string): Promise<Chat> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/chats/${chatId}/assign`, {
+      method: 'POST',
+      headers: getAuthHeaders(),
+      body: JSON.stringify({
+        manager_id: managerId,
+        manager_name: managerName
+      }),
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.detail || 'Failed to assign chat');
+    }
+    
+    const result = await response.json();
+    
+    // We need to return a Chat object, but the endpoint returns a result object.
+    // Ideally we should fetch the updated chat, but for now let's construct it or fetch it.
+    // Let's fetch the updated chat to be safe and consistent.
+    const chatResponse = await fetchWithTokenRefresh(`${API_URL}/chats/${chatId}`);
+    if (chatResponse.ok) {
+        return await chatResponse.json();
+    }
+    
+    throw new Error('Failed to fetch updated chat');
+  } catch (error) {
+    console.error('Error assigning chat:', error);
+    toast.error('Не удалось взять чат');
+    throw error;
+  }
+};
 
 // Get all chats
 export const getChats = async (): Promise<Chat[]> => {
@@ -151,7 +237,10 @@ export const getChats = async (): Promise<Chat[]> => {
         messager: String(c["messager"] ?? ""),
         lastMessage: String(lastMessage?.["content"] ?? ""),
         lastMessageTime: String(lastMessage?.["timestamp"] ?? ""),
-        unread: false // This should be implemented based on your business logic
+        unread: false, // This should be implemented based on your business logic
+        assigned_manager_id: c["assigned_manager_id"] ? Number(c["assigned_manager_id"]) : undefined,
+        assigned_manager_name: c["assigned_manager_name"] ? String(c["assigned_manager_name"]) : undefined,
+        dialog_status: (c["dialog_status"] as any) || 'new'
       };
     });
   } catch (error) {
@@ -313,6 +402,26 @@ export const getChatStats = async (): Promise<{ total: number, pending: number, 
   } catch (error) {
     console.error('Error fetching chat statistics:', error);
     return { total: 0, pending: 0, ai: 0 };
+  }
+};
+
+// Delete a message
+export const deleteMessage = async (messageId: number): Promise<void> => {
+  try {
+    const response = await fetchWithTokenRefresh(`${API_URL}/messages/${messageId}`, {
+      method: 'DELETE',
+      headers: getAuthHeaders(),
+    });
+    
+    if (!response.ok) {
+      const errorData = await response.json();
+      console.error('Failed to delete message:', errorData);
+      throw new Error('Failed to delete message');
+    }
+  } catch (error) {
+    console.error('Error deleting message:', error);
+    toast.error('Не удалось удалить сообщение');
+    throw error;
   }
 };
 
@@ -599,7 +708,7 @@ export const getAllAnalytics = async (): Promise<DialogAnalytics[]> => {
 // Get analytics stats
 export const getAnalyticsStats = async (): Promise<{
   total_dialogs: number;
-  avg_quality_score: number;
+  avg_quality_score: number | null;
   sentiment_distribution: Record<string, number>;
   resolution_distribution: Record<string, number>;
 }> => {
@@ -608,7 +717,14 @@ export const getAnalyticsStats = async (): Promise<{
     if (!response.ok) {
       throw new Error('Failed to fetch analytics stats');
     }
-    return await response.json();
+    const data = await response.json();
+    // Маппинг полей с бэкенда
+    return {
+      total_dialogs: data.total_analyzed || 0,
+      avg_quality_score: data.avg_manager_score ?? null,
+      sentiment_distribution: data.sentiment || {},
+      resolution_distribution: { resolved: 0, pending: 0 },
+    };
   } catch (error) {
     console.error('Error fetching analytics stats:', error);
     return {

@@ -20,7 +20,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy.ext.asyncio import AsyncSession
-from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag, sync_vk, get_ai_settings, upsert_ai_settings, get_ai_knowledge, save_ai_knowledge, assign_chat_to_manager, close_chat_dialog, create_dialog_analytics, get_dialog_analytics, get_all_analytics, get_analytics_stats, DialogAnalytics
+from crud import async_session, engine, Base, get_chats, get_chat, get_messages, create_chat, create_message, update_chat_waiting, update_chat_ai, get_stats, get_chats_with_last_messages, get_chat_messages, get_chat_by_uuid, add_chat_tag, remove_chat_tag, sync_vk, get_ai_settings, upsert_ai_settings, get_ai_knowledge, save_ai_knowledge, assign_chat_to_manager, close_chat_dialog, create_dialog_analytics, get_dialog_analytics, get_all_analytics, get_analytics_stats, DialogAnalytics, get_chat_by_topic_id, update_chat_topic_id
 import requests
 from pydantic import BaseModel, validator
 from shared import get_bot
@@ -29,7 +29,7 @@ from contextlib import asynccontextmanager
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from decimal import Decimal
-from sqlalchemy import select, insert
+from sqlalchemy import select, insert, text as sa_text
 from crud import Message
 import crud
 from aiogram import F
@@ -67,79 +67,21 @@ AI_SETTINGS_TTL_SECONDS = int(os.getenv("AI_SETTINGS_TTL_SECONDS", "30"))
 AI_KNOWLEDGE_TTL_SECONDS = int(os.getenv("AI_KNOWLEDGE_TTL_SECONDS", "300"))
 
 DEFAULT_AI_SETTINGS = {
-    "system_message": "Ты — первый менеджер бренда. Отвечай только по фактам из предоставленного контекста и данных сайта.",
+    "system_message": "",
     "faqs": "",
-    "rules": "Если информации нет в контексте или вопрос про заказы/трек — передай менеджеру. Не выдумывай.",
-    "tone": "дружелюбный, мягкий, лаконичный",
-    "handoff_phrases": "хочу человека\nменеджер\nоператор\nне бот\nживой\nсвяжи с человеком",
+    "rules": "",
+    "tone": "",
+    "handoff_phrases": "",
     "min_score": 0.2,
     "site_pages": "",
-    "auto_refresh_minutes": 10,
+    "auto_refresh_minutes": 0,
 }
 
 AI_SETTINGS_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 AI_KNOWLEDGE_CACHE: Dict[str, Any] = {"data": [], "tokens": [], "ts": 0.0}
 AI_STATUS: Dict[str, Any] = {"last_indexed": None, "last_error": None, "chunks": 0}
 
-FAQ_INLINE_RAW = """
-Q: Delivery Time? (Когда ожидать доставку?)
-A: **Срок зависит** от того, в наличии ли вещь или на предзаказе. Если в наличии — отправка на следующий день. Если предзаказ — сроки производства и отправки устанавливаются брендом. **Точные сроки** по предзаказу подскажет менеджер. Хотите, чтобы я связал вас с ним?
-
-Q: Tell me the status of order XXXXX (Подскажи статус заказа XXXXX?)
-A: В данный момент я не могу называть статусы заказов, но могу перевести вас на менеджера. Подключить вас?
-
-Q: What is Pre-order? (Что такое предзаказ?)
-A: Предзаказ — это резервирование вещи до ее производства. Вы заранее предоставляете средства на пошив и получаете товар одним из первых.
-
-Q: How long is Pre-order? (Как долго ожидать вещи с предзаказа?)
-A: Обычно от 2 до 4 недель, но срок может сдвигаться. Лучше уточните у менеджера — хотите, чтобы я вас с ним связал?
-
-Q: Return Policy? (Как отменить/вернуть заказ?)
-A: Возврат согласуется с менеджером. Товар должен быть надлежащего качества и возвратным. Возврат платный (по тарифу доставки). В посылке должно быть заявление (бланк у менеджера). **Отмена заказа** возможна только в первые 30 минут после оформления.
-
-Q: Size Guide? (Где находится таблица размеров?)
-A: Таблицы размещены на сайте — в описании товара или на изображениях. Если её нет — значит таблицы для этой вещи не существует. Можно уточнить у менеджера.
-
-Q: Why is shipping delayed? (Почему отправка так затянулась?)
-A: Скорее всего, вы заказали товар на предзаказе, либо заказ в статусе «на утверждении».
-
-Q: Is it a Pre-order? (Как определить, на предзаказе ли вещь?)
-A: Если перед названием товара на сайте стоит «+» — вещь в наличии. Если нет знака — это предзаказ. Можно уточнить у менеджера. Хотите, свяжу вас с менеджером?
-
-Q: What if my order has both pre-order and in-stock items? (Когда будет отправка, если в заказе и то и другое?)
-A: Заказ отправляется, когда все позиции готовы. Но можно разделить заказ — вас связать с менеджером?
-
-Q: International Shipping? (Доставляете ли вы вещи за границы РФ?)
-A: Да, доставляем. Для оформления вам нужно связаться с менеджером. Перевести вас на менеджера?
-
-Q: Which carriers do you use? (Какими службами доставки отправляете?)
-A: Почта России и СДЭК.
-
-Q: How do I choose a size? (Как подобрать размер?)
-A: Ориентируйтесь на таблицу размеров на странице товара. Если таблицы нет — уточните у менеджера, он подскажет по меркам.
-
-Q: Which items are non-returnable? (Какие товары не подлежат возврату?)
-A: Бельевые изделия (швейные и трикотажные) и чулочно-носочные изделия (согласно Пост. Правительства РФ №55).
-
-Q: How should I care for PSIH items? (Как ухаживать за вещами PSIH?)
-A: Ручная или деликатная стирка 15–30°С, вывернуть наизнанку, без отбеливателя. Кастом — стирать отдельно, места с росписью не тереть, сушить горизонтально, без прямого солнца. Гладить щадяще с изнанки; рисунок — только через ткань; без отпаривателя.
-
-Q: What if my item is defective? (Что делать, если брак?)
-A: Брак подтверждается экспертизой; при подтверждении возможен возврат/обмен. Продавец может согласовать возврат/обмен без экспертизы — по ситуации.
-
---- Brand Information & Details ---
-🧠 **Общая информация о бренде ПСИХ**
-• **Название:** ПСИХ (PSIH)
-• **Официальный сайт:** https://psihclothes.com/
-• **VK:** https://vk.com/psihclothes
-
-🎭 **Концепция и философия бренда**
-ПСИХ — это не просто одежда, это способ самовыражения, отражающий внутренние переживания и эмоции.
-
-🛍️ **Покупка и доставка**
-Оформление заказов: через сайт psihclothes.com. Доставка: по России и в другие страны.
---- End Brand Information & Details ---
-""".strip()
+FAQ_INLINE_RAW = ""
 
 CATALOG_API_URL = os.getenv("CATALOG_API_URL")
 CATALOG_AUTH_TOKEN = os.getenv("CATALOG_AUTH_TOKEN")
@@ -465,9 +407,11 @@ def vk_kb_faq_item(item_id: str, page: int = 1) -> Optional[str]:
 def vk_kb_categories(categories: List[Dict[str, Any]]) -> Optional[str]:
     kb = VkKeyboard(one_time=False, inline=True)
     for c in categories[:6]:
-        cid = str(c.get("slug") or "")
+        # Пытаемся получить slug, если нет - используем id
+        cid = str(c.get("slug") or c.get("id") or "")
         name = str(c.get("name") or "Категория")[:38]
         if not cid:
+            logging.warning(f"Category without ID/slug: {c}")
             continue
         kb.add_button(name, color=VkKeyboardColor.PRIMARY, payload={"cmd": "cat_open", "id": cid, "page": 1})
         kb.add_line()
@@ -693,6 +637,24 @@ def _extract_image_url(obj: Any) -> Optional[str]:
                 return _catalog_abs_url(v) if not v.startswith("http") else v
     return None
 
+def _normalize_sections(raw_sections: Any) -> List[Dict[str, str]]:
+    sections: List[Dict[str, str]] = []
+    if not isinstance(raw_sections, list):
+        return sections
+    for s in raw_sections:
+        if isinstance(s, str):
+            title = ""
+            content = s.strip()
+        elif isinstance(s, dict):
+            title = str(s.get("title") or s.get("name") or s.get("label") or "").strip()
+            content = str(s.get("content") or s.get("text") or s.get("body") or "").strip()
+        else:
+            continue
+        if not content and not title:
+            continue
+        sections.append({"title": title, "content": content})
+    return sections
+
 def _flatten_categories(tree: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     stack: List[Any] = []
@@ -744,6 +706,15 @@ def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
     if not name:
         name = f"Товар {pid}"
     description = str(raw.get("description") or raw.get("desc") or "").strip()
+    composition = str(raw.get("composition") or "").strip()
+    fit = str(raw.get("fit") or "").strip()
+    meta_raw = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    meta = {
+        "care": str(meta_raw.get("care") or raw.get("meta_care") or "").strip(),
+        "shipping": str(meta_raw.get("shipping") or raw.get("meta_shipping") or "").strip(),
+        "returns": str(meta_raw.get("returns") or raw.get("meta_returns") or "").strip(),
+    }
+    sections = _normalize_sections(raw.get("custom_sections") or raw.get("sections") or raw.get("accordions") or [])
     url = str(raw.get("url") or raw.get("link") or "").strip()
     price = raw.get("price") or raw.get("cost")
     base_id = raw.get("product_id") or raw.get("base_product_id") or raw.get("baseProductId")
@@ -798,6 +769,10 @@ def _normalize_product(raw: Any) -> Optional[Dict[str, Any]]:
         "name": name,
         "slug": slug,
         "description": description,
+        "composition": composition,
+        "fit": fit,
+        "meta": meta,
+        "sections": sections,
         "url": url,
         "price": price,
         "images": images,
@@ -911,6 +886,24 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
         if not name:
             name = f"Товар {pid}"
         description = str(raw.get("description") or raw.get("desc") or "").strip()
+        composition = str(raw.get("composition") or "").strip()
+        fit = str(raw.get("fit") or "").strip()
+        meta_raw = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        meta = {
+            "care": str(meta_raw.get("care") or raw.get("meta_care") or "").strip(),
+            "shipping": str(meta_raw.get("shipping") or raw.get("meta_shipping") or "").strip(),
+            "returns": str(meta_raw.get("returns") or raw.get("meta_returns") or "").strip(),
+        }
+        sections = _normalize_sections(raw.get("custom_sections") or raw.get("sections") or raw.get("accordions") or [])
+        composition = str(raw.get("composition") or "").strip()
+        fit = str(raw.get("fit") or "").strip()
+        meta_raw = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+        meta = {
+            "care": str(meta_raw.get("care") or raw.get("meta_care") or "").strip(),
+            "shipping": str(meta_raw.get("shipping") or raw.get("meta_shipping") or "").strip(),
+            "returns": str(meta_raw.get("returns") or raw.get("meta_returns") or "").strip(),
+        }
+        sections = _normalize_sections(raw.get("custom_sections") or raw.get("sections") or raw.get("accordions") or [])
         url = str(raw.get("url") or raw.get("link") or "").strip()
         price = raw.get("price") or raw.get("cost")
         main_category = raw.get("main_category") if isinstance(raw.get("main_category"), dict) else {}
@@ -948,6 +941,10 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
                 "name": name,
                 "slug": slug,
                 "description": description,
+                "composition": composition,
+                "fit": fit,
+                "meta": meta,
+                "sections": sections,
                 "url": url,
                 "price": price,
                 "images": images,
@@ -972,6 +969,10 @@ async def catalog_get_products(category_id: str, page: int = 1, limit: int = 8) 
                 "name": name,
                 "slug": slug,
                 "description": description,
+                "composition": composition,
+                "fit": fit,
+                "meta": meta,
+                "sections": sections,
                 "url": url,
                 "price": price,
                 "images": images,
@@ -1072,6 +1073,10 @@ async def catalog_search_products(query: str, limit: int = 12) -> List[Dict[str,
             "name": name,
             "slug": slug,
             "description": description,
+            "composition": composition,
+            "fit": fit,
+            "meta": meta,
+            "sections": sections,
             "url": url,
             "price": price,
             "images": images,
@@ -1083,15 +1088,20 @@ async def catalog_search_products(query: str, limit: int = 12) -> List[Dict[str,
     return normalized
 
 async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
+    logging.info(f"🛒 catalog_get_product called with product_id={product_id}")
     cached_variants = _catalog_cache.get("product_variants") or {}
     if cached_variants.get("data") and _catalog_is_fresh(cached_variants.get("ts", 0.0)):
         pv = cached_variants["data"].get(str(product_id))
         if pv:
+            logging.info(f"🛒 Returning from variants cache")
             return pv
     cached = _catalog_cache["product"].get(product_id)
     if cached and _catalog_is_fresh(cached["ts"]):
+        logging.info(f"🛒 Returning from product cache")
         return cached["data"]
+    logging.info(f"🛒 Fetching from API: /api/products/{product_id}")
     base = await _catalog_get_json(f"/api/products/{product_id}")
+    logging.info(f"🛒 API response keys: {list(base.keys()) if isinstance(base, dict) else type(base)}")
     if base is None:
         base = await _catalog_get_json(f"/api/products/slug/{product_id}")
     if not isinstance(base, dict):
@@ -1108,9 +1118,21 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
     if not name:
         name = f"Товар {pid}"
     description = str(base.get("description") or base.get("desc") or "").strip()
+    composition = str(base.get("composition") or "").strip()
+    fit = str(base.get("fit") or "").strip()
     url = str(base.get("url") or base.get("link") or "").strip()
     price = base.get("price") or base.get("cost")
     base_id = base.get("product_id") or base.get("base_product_id") or base.get("baseProductId")
+    meta_raw = base.get("meta") if isinstance(base.get("meta"), dict) else {}
+    meta = {
+        "care": str(meta_raw.get("care") or base.get("meta_care") or "").strip(),
+        "shipping": str(meta_raw.get("shipping") or base.get("meta_shipping") or "").strip(),
+        "returns": str(meta_raw.get("returns") or base.get("meta_returns") or "").strip(),
+    }
+    sections = _normalize_sections(base.get("custom_sections") or base.get("sections") or base.get("accordions") or [])
+    if not sections and base_id is not None:
+        sections_data = await _catalog_get_json(f"/api/products/{base_id}/sections")
+        sections = _normalize_sections(sections_data)
 
     images: List[str] = []
     for k in ("primary_image", "image", "cover"):
@@ -1122,9 +1144,10 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
         imgs = [_extract_image_url(x) for x in base.get("images")]
         images = [x for x in imgs if x]
 
-    colors_data = await _catalog_get_json(f"/api/products/{product_id}/colors")
     color_entries: List[Dict[str, Any]] = []
-    if isinstance(colors_data, list):
+    colors_data = base.get("colors") if isinstance(base.get("colors"), list) else None
+    logging.info(f"🎨 catalog_get_product colors_data from response: {len(colors_data) if colors_data else 0} items")
+    if isinstance(colors_data, list) and colors_data:
         for c in colors_data:
             if not isinstance(c, dict):
                 continue
@@ -1132,7 +1155,33 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
             cname = str(c.get("label") or c.get("name") or c.get("title") or c.get("color") or c.get("value") or c.get("color_name") or "").strip()
             if cid is None or not cname:
                 continue
-            color_entries.append({"id": str(cid), "name": cname})
+            sizes_raw = c.get("sizes") if isinstance(c.get("sizes"), list) else []
+            sizes: List[Dict[str, Any]] = []
+            for s in sizes_raw:
+                if not isinstance(s, dict):
+                    continue
+                size_name = str(s.get("size") or s.get("name") or s.get("label") or s.get("title") or "").strip()
+                if not size_name:
+                    continue
+                sizes.append({
+                    "name": size_name,
+                    "available": (s.get("quantity") or 0) > 0 if "quantity" in s else s.get("available"),
+                    "qty": s.get("quantity"),
+                })
+            color_entries.append({"id": str(cid), "name": cname, "sizes": sizes})
+    else:
+        logging.info(f"🎨 No colors in response, fetching from /api/products/{product_id}/colors")
+        colors_data = await _catalog_get_json(f"/api/products/{product_id}/colors")
+        logging.info(f"🎨 Fetched colors_data: {colors_data}")
+        if isinstance(colors_data, list):
+            for c in colors_data:
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("id") or c.get("product_color_id") or c.get("color_id")
+                cname = str(c.get("label") or c.get("name") or c.get("title") or c.get("color") or c.get("value") or c.get("color_name") or "").strip()
+                if cid is None or not cname:
+                    continue
+                color_entries.append({"id": str(cid), "name": cname})
 
     product: Dict[str, Any] = {
         "id": str(pid),
@@ -1140,6 +1189,10 @@ async def catalog_get_product(product_id: str) -> Optional[Dict[str, Any]]:
         "name": name,
         "slug": slug,
         "description": description,
+        "composition": composition,
+        "fit": fit,
+        "meta": meta,
+        "sections": sections,
         "url": url,
         "price": price,
         "images": images,
@@ -1165,21 +1218,26 @@ async def catalog_get_color_images(product_color_id: str) -> List[str]:
     return urls
 
 async def catalog_get_color_sizes(product_color_id: str) -> List[Dict[str, Any]]:
+    logging.info(f"📦 catalog_get_color_sizes called with product_color_id={product_color_id}")
     data = await _catalog_get_json(f"/api/products/colors/{product_color_id}/sizes")
+    logging.info(f"📦 Raw sizes response: {data}")
     if not isinstance(data, list):
+        logging.info(f"📦 Response is not a list, returning empty")
         return []
     out: List[Dict[str, Any]] = []
     for it in data:
         if not isinstance(it, dict):
             continue
-        name = str(it.get("name") or it.get("label") or it.get("title") or "").strip()
+        name = str(it.get("size") or it.get("name") or it.get("label") or it.get("title") or "").strip()
+        logging.info(f"📦 Processing size item: {it}, extracted name: {name}")
         if not name:
             continue
         out.append({
             "name": name,
-            "available": it.get("available") if "available" in it else it.get("in_stock"),
-            "qty": it.get("qty") or it.get("stock"),
+            "available": (it.get("quantity") or 0) > 0 if "quantity" in it else it.get("available") if "available" in it else it.get("in_stock"),
+            "qty": it.get("qty") or it.get("stock") or it.get("quantity"),
         })
+    logging.info(f"📦 Final sizes: {out}")
     return out
 
 async def catalog_get_collections() -> List[Dict[str, Any]]:
@@ -1338,11 +1396,41 @@ def _ai_score(query_tokens: List[str], chunk_tokens: List[str]) -> float:
 def _ai_parse_lines(raw: str) -> List[str]:
     return [line.strip() for line in (raw or "").splitlines() if line.strip()]
 
+def _ai_trim(text: str, max_len: int = 320) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rstrip() + "…"
+
+def _ai_cleanup_answer(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"\*([^*]+)\*", r"\1", cleaned)
+    cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
+    cleaned = re.sub(r"_([^_]+)_", r"\1", cleaned)
+    cleaned = cleaned.replace("**", "").replace("__", "")
+    cleaned = cleaned.replace("*", "").replace("_", "")
+    return cleaned.strip()
+
+
 def _ai_is_order_question(text_norm: str) -> bool:
     keywords = [
-        "заказ", "трек", "трекномер", "номер заказа", "статус заказа", "order", "tracking", "track",
+        "заказ", "трек", "трекномер", "номер заказа", "статус заказа",
+        "отслед", "отслеж", "tracking", "track", "parcel", "shipment",
     ]
-    return any(k in text_norm for k in keywords)
+    if any(k in text_norm for k in keywords):
+        return True
+    # Дополнительные шаблоны для вопросов о статусе/треке
+    patterns = [
+        r"\bгде\s+посыл",          # где посылка/посылку
+        r"\bкак\s+отслед",         # как отследить
+        r"\bстатус\s+заказ",       # статус заказа
+        r"\bномер\s+заказ",        # номер заказа
+    ]
+    return any(re.search(p, text_norm) for p in patterns)
+
 
 def _ai_is_greeting(text_norm: str) -> bool:
     greetings = [
@@ -1433,33 +1521,66 @@ def _ai_is_history_question(text_norm: str) -> bool:
 
 def _ai_greeting_reply(raw_text: str) -> str:
     if _ai_is_latin(raw_text):
-        return "Hello! I’m the PSIH AI assistant. How can I help with products, shipping, or returns?"
-    return "Привет! Я AI-ассистент PSIH. Чем могу помочь по товарам, доставке или возвратам?"
+        return "Hello! How can I help you?"
+    return "Привет! Чем могу помочь?"
 
-def _ai_handoff_reply(reason: Optional[str]) -> str:
-    if reason in {"user_request", "orders"}:
-        return "Я позвал менеджера. Напишите, что нужно — он подключится."
-    return "Не нашёл информацию на сайте — подключаю менеджера."
+async def _ai_generate_text(prompt: str) -> str:
+    """Генерирует короткий ответ через LLM без шаблонов"""
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Ты отвечаешь коротко, вежливо и по делу. "
+                "Не используй шаблонные фразы. "
+                "Верни только текст ответа без markdown."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    data = await _ai_openrouter(messages)
+    if not data:
+        return ""
+    try:
+        return str(data["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return ""
 
-def _ai_soft_refusal_reply() -> str:
-    return (
-        "Я не помогаю с такими вопросами. "
-        "Могу ответить по товарам, доставке или возвратам. "
-        "Если хотите менеджера — напишите «менеджер»."
+async def _ai_handoff_reply() -> str:
+    """Сообщение о передаче менеджеру без шаблона"""
+    return await _ai_generate_text(
+        "Клиент подтвердил связь с менеджером. Сообщи, что запрос передан менеджеру и он свяжется. Один короткий ответ."
     )
 
-def _ai_generic_fallback_reply() -> str:
-    return (
-        "Могу помочь по товарам, доставке или возвратам. "
-        "Напишите, что именно вас интересует."
+async def _ai_handoff_question(question: str) -> str:
+    """Вопрос о передаче менеджеру без шаблона"""
+    return await _ai_generate_text(
+        f"Клиент спросил: «{question}». "
+        "Коротко и вежливо скажи что сейчас подключишь менеджера для помощи. "
+        "НЕ предлагай 'связаться' — скажи что менеджер скоро ответит. "
+        "Ответ должен быть 1-2 предложения, без списков и без предложений помочь с товарами."
     )
+
+def _ai_is_handoff_confirm(text_norm: str) -> bool:
+    """Определяет согласие пользователя на связь с менеджером"""
+    triggers = {
+        "да", "давай", "дайте", "ок", "окей", "ага", "угу", "можно",
+        "свяжи", "свяжите", "подключи", "подключите", "позови", "позовите",
+        "менеджер", "оператор", "человек", "поддержка",
+    }
+    if not text_norm:
+        return False
+    tokens = set(_ai_tokenize(text_norm))
+    for t in triggers:
+        tt = _normalize(t)
+        if " " in tt and tt in text_norm:
+            return True
+        if tt in tokens:
+            return True
+    return False
 
 def _ai_recommendation_reply() -> str:
-    return (
-        "С удовольствием помогу с выбором. "
-        "Напишите, что именно ищете (тип вещи, размер, бюджет, цвет) — подберу варианты. "
-        "Либо откройте «Каталог»."
-    )
+    return "Напишите, что ищете — постараюсь помочь с выбором."
+
 
 async def _ai_get_settings(db: AsyncSession) -> Dict[str, Any]:
     cached = AI_SETTINGS_CACHE.get("data")
@@ -1470,12 +1591,12 @@ async def _ai_get_settings(db: AsyncSession) -> Dict[str, Any]:
     if not settings:
         settings = await upsert_ai_settings(db, DEFAULT_AI_SETTINGS.copy())
     data = {
-        "system_message": settings.system_message or DEFAULT_AI_SETTINGS["system_message"],
+        "system_message": settings.system_message or "",
         "faqs": settings.faqs or "",
-        "rules": settings.rules or DEFAULT_AI_SETTINGS["rules"],
-        "tone": settings.tone or DEFAULT_AI_SETTINGS["tone"],
-        "handoff_phrases": settings.handoff_phrases or DEFAULT_AI_SETTINGS["handoff_phrases"],
-        "min_score": float(settings.min_score) if settings.min_score is not None else DEFAULT_AI_SETTINGS["min_score"],
+        "rules": settings.rules or "",
+        "tone": settings.tone or "",
+        "handoff_phrases": settings.handoff_phrases or "",
+        "min_score": float(settings.min_score) if settings.min_score is not None else 0.2,
         "site_pages": settings.site_pages or "",
         "auto_refresh_minutes": int(settings.auto_refresh_minutes or 0),
     }
@@ -1557,6 +1678,35 @@ async def _ai_build_knowledge(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
             text += f". Цена: {price_text}"
         if p.get("description"):
             text += f". Описание: {p.get('description')}"
+        if p.get("composition"):
+            text += f". Состав: {p.get('composition')}"
+        if p.get("fit"):
+            text += f". Посадка: {p.get('fit')}"
+        meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+        if meta.get("care"):
+            text += f". Уход: {_ai_trim(str(meta.get('care')))}"
+        if meta.get("shipping"):
+            text += f". Доставка: {_ai_trim(str(meta.get('shipping')))}"
+        if meta.get("returns"):
+            text += f". Возврат: {_ai_trim(str(meta.get('returns')))}"
+        sections = p.get("sections") if isinstance(p.get("sections"), list) else []
+        section_texts: List[str] = []
+        for s in sections:
+            if not isinstance(s, dict):
+                continue
+            title = str(s.get("title") or "").strip()
+            content = str(s.get("content") or "").strip()
+            if not content and not title:
+                continue
+            content = _ai_trim(_ai_strip_html(content), 280)
+            if title:
+                section_texts.append(f"{title}: {content}")
+            else:
+                section_texts.append(content)
+            if len(section_texts) >= 3:
+                break
+        if section_texts:
+            text += f". Дополнительно: {'; '.join(section_texts)}"
         if p.get("colors"):
             text += f". Цвета: {', '.join([str(x) for x in p.get('colors') if x])}"
         if p.get("url"):
@@ -1584,6 +1734,14 @@ async def _ai_build_knowledge(settings: Dict[str, Any]) -> List[Dict[str, Any]]:
             "source": "admin_faqs",
             "tags": ["faq"],
         })
+    else:
+        inline_faq = FAQ_INLINE_RAW.strip()
+        if inline_faq:
+            chunks.append({
+                "text": inline_faq,
+                "source": "inline_faqs",
+                "tags": ["faq"],
+            })
 
     return chunks
 
@@ -1688,14 +1846,27 @@ def _ai_extract_json(text: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
 
-async def _ai_build_sizes_context(product_id: str) -> str:
+async def _ai_build_sizes_context(product_id: str, fallback_id: Optional[str] = None) -> str:
+    logging.info(f"🔍 _ai_build_sizes_context called with product_id={product_id}, fallback_id={fallback_id}")
     product = await catalog_get_product(product_id)
+    logging.info(f"🔍 Got product: {product.get('name') if product else 'None'}, color_entries: {len(product.get('color_entries', [])) if product else 0}")
+    if (not product or not product.get("color_entries")) and fallback_id and fallback_id != product_id:
+        logging.info(f"🔍 Trying fallback_id={fallback_id}")
+        product = await catalog_get_product(fallback_id)
     if not product:
+        logging.info("🔍 No product found, returning empty")
         return ""
     parts: List[str] = []
     for entry in product.get("color_entries", []):
-        sizes = await catalog_get_color_sizes(str(entry.get("id")))
+        logging.info(f"🔍 Processing color entry: {entry}")
+        sizes = entry.get("sizes") if isinstance(entry, dict) else None
+        logging.info(f"🔍 Inline sizes: {sizes}")
         if not sizes:
+            logging.info(f"🔍 Fetching sizes for color_id={entry.get('id')}")
+            sizes = await catalog_get_color_sizes(str(entry.get("id")))
+            logging.info(f"🔍 Fetched sizes: {sizes}")
+        if not sizes:
+            logging.info(f"🔍 No sizes for color {entry.get('name')}")
             continue
         label = entry.get("name") or "Цвет"
         sizes_text = []
@@ -1709,32 +1880,22 @@ async def _ai_build_sizes_context(product_id: str) -> str:
         if sizes_text:
             parts.append(f"{label}: {', '.join(sizes_text)}")
     if not parts:
+        logging.info("🔍 No sizes found for any color")
         return ""
-    return "Размеры и наличие по цветам:\n" + "\n".join(parts)
+    result = "Размеры и наличие по цветам:\n" + "\n".join(parts)
+    logging.info(f"🔍 Sizes context: {result}")
+    return result
 
-async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Optional[str] = None, product_id: Optional[str] = None, product_categories: Optional[List[str]] = None, conversation_history: Optional[str] = None, previous_user_message: Optional[str] = None) -> Dict[str, Any]:
+async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Optional[str] = None, product_id: Optional[str] = None, product_base_id: Optional[str] = None, product_categories: Optional[List[str]] = None, conversation_history: Optional[str] = None, previous_user_message: Optional[str] = None, is_product_question: bool = False) -> Dict[str, Any]:
     settings = await _ai_get_settings(db)
     text_norm = _normalize(question)
-    
-    # Только критичные проверки - остальное пусть обрабатывает AI
-    if _ai_is_order_question(text_norm):
-        return {"handoff": True, "answer": "", "confidence": 0.0, "reason": "orders"}
 
-    phrases = _ai_parse_lines(settings.get("handoff_phrases", ""))
-    if any(p in text_norm for p in [_normalize(p) for p in phrases] if p):
-        return {"handoff": True, "answer": "", "confidence": 0.0, "reason": "user_request"}
+    # Все вопросы отправляем в AI — без шаблонных ответов.
 
-    if previous_user_message and _ai_is_history_question(text_norm):
-        return {
-            "handoff": False,
-            "answer": f"Вы писали: {previous_user_message}",
-            "confidence": 1.0,
-            "reason": "history_answer",
-        }
 
     context_parts: List[str] = []
     top_score = 0.0
-    min_score = float(settings.get("min_score") or DEFAULT_AI_SETTINGS["min_score"])
+    min_score = float(settings.get("min_score") or 0.2)
     context_text = ""
 
     if not extra_context and _ai_has_product_intent(text_norm):
@@ -1757,7 +1918,7 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
     if not context_text and extra_context:
         context_parts.append(extra_context.strip())
         if ("размер" in text_norm or "налич" in text_norm) and product_id:
-            sizes_ctx = await _ai_build_sizes_context(str(product_id))
+            sizes_ctx = await _ai_build_sizes_context(str(product_id), fallback_id=str(product_base_id) if product_base_id else None)
             if sizes_ctx:
                 context_parts.append(sizes_ctx)
         context_text = "\n\n".join([p for p in context_parts if p])
@@ -1775,7 +1936,7 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
         top_score = scored[0][0] if scored else 0.0
         logging.info(f"🎯 Search scores - Top: {top_score:.3f}, Min required: {min_score:.3f}, Total matches: {len(scored)}")
         if top_score < min_score:
-            context_text = "Общий запрос пользователя. Ответь вежливо и нейтрально, без фактов, и предложи помощь по товарам, доставке или возвратам."
+            context_text = "В базе знаний нет релевантной информации по этому запросу. Отвечай СТРОГО по системному промту. Не выдумывай факты."
         else:
             top_chunks = [c for _, c in scored[:AI_TOP_K]]
             if "размер" in text_norm or "налич" in text_norm:
@@ -1783,7 +1944,7 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
                     meta = c.get("meta") or {}
                     pid = meta.get("product_id")
                     if pid:
-                        sizes_ctx = await _ai_build_sizes_context(str(pid))
+                        sizes_ctx = await _ai_build_sizes_context(str(pid), fallback_id=None)
                         if sizes_ctx:
                             context_parts.append(sizes_ctx)
                         break
@@ -1791,31 +1952,52 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
             context_parts.extend([c.get("text", "") for c in top_chunks if c.get("text")])
             context_text = "\n\n".join([p for p in context_parts if p])
     if not context_text:
-        context_text = "Общий запрос пользователя. Ответь вежливо и нейтрально, без фактов, и предложи помощь по товарам, доставке или возвратам."
+        context_text = "В базе знаний нет релевантной информации по этому запросу. Отвечай СТРОГО по системному промту. Не выдумывай факты."
 
     if conversation_history:
         context_text = f"История диалога:\n{conversation_history}\n\n{context_text}"
 
-    system_message = settings.get("system_message") or DEFAULT_AI_SETTINGS["system_message"]
-    rules = settings.get("rules") or DEFAULT_AI_SETTINGS["rules"]
-    tone = settings.get("tone") or DEFAULT_AI_SETTINGS["tone"]
+    logging.info(f"📝 Final context_text for AI:\n{context_text[:500]}...")
+    
+    json_format = (
+        "\nФормат ответа — ТОЛЬКО JSON без markdown:\n"
+        '{{"answer": "твой ответ", "handoff": false, "confidence": 0.8}}\n'
+        "answer — текст ответа клиенту, handoff — true если нужен менеджер, "
+        "confidence — уверенность 0.0-1.0."
+    )
+
+    if is_product_question:
+        # "Спросить у ИИ" — отвечаем по контексту товара, без промта поддержки
+        system_content = (
+            "Ты — консультант по товарам. Отвечай на вопросы клиента о товаре "
+            "на основе предоставленного контекста. Будь кратким и полезным."
+            + json_format
+        )
+    else:
+        # Поддержка — промт берётся с сайта /message-box
+        system_message = settings.get("system_message") or ""
+        rules = settings.get("rules") or ""
+        tone = settings.get("tone") or ""
+
+        system_parts = []
+        if system_message:
+            system_parts.append(system_message)
+        if tone:
+            system_parts.append(f"Тон общения: {tone}")
+        if rules:
+            system_parts.append(f"Дополнительные правила: {rules}")
+
+        base_prompt = ("\n\n".join(system_parts) + "\n\n") if system_parts else ""
+        system_content = base_prompt + json_format
 
     messages = [
         {
             "role": "system",
-            "content": (
-                f"{system_message}\n\n"
-                f"Тон: {tone}\n"
-                f"Правила: {rules}\n"
-                "Ответ обязан быть основан только на контексте ниже.\n"
-                "Если информации недостаточно — ответь нейтрально и предложи помощь по товарам, доставке или возвратам.\n"
-                "Историю диалога можно использовать, если она есть в контексте.\n"
-                "Верни JSON без Markdown."
-            )
+            "content": system_content
         },
         {
             "role": "user",
-            "content": f"Контекст:\n{context_text}\n\nВопрос: {question}\n\nВерни JSON формата: {{\"answer\":\"...\",\"handoff\":false,\"confidence\":0.0}}"
+            "content": f"Контекст:\n{context_text}\n\nВопрос клиента: {question}"
         }
     ]
     data = await _ai_openrouter(messages)
@@ -1825,22 +2007,47 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
     content = ""
     try:
         content = data["choices"][0]["message"]["content"]
+        logging.info(f"🤖 OpenAI raw response: {content[:300]}...")
     except Exception:
         content = ""
-    parsed = _ai_extract_json(content) or {}
+    
+    parsed = _ai_extract_json(content)
+    if not parsed and content.strip():
+        logging.warning("⚠️ AI returned non-JSON answer, using raw text fallback.")
+        return {
+            "handoff": False,
+            "answer": content.strip(),
+            "confidence": top_score,
+            "reason": "fallback_text",
+        }
+    parsed = parsed or {}
     answer = str(parsed.get("answer") or "").strip()
     handoff = bool(parsed.get("handoff"))
+    
+    # Если AI решил передать менеджеру - передаем ВСЕГДА
     if handoff:
-        if answer:
-            return {"handoff": False, "answer": answer, "confidence": float(parsed.get("confidence") or top_score), "reason": "model_handoff_ignored"}
-        return {"handoff": False, "answer": _ai_generic_fallback_reply(), "confidence": top_score, "reason": "model_handoff_fallback"}
+        return {
+            "handoff": True, 
+            "answer": "", 
+            "confidence": float(parsed.get("confidence") or top_score), 
+            "reason": "ai_escalation"
+        }
+    
+    # Если ответ пустой - тоже передаем менеджеру
     if not answer:
-        return {"handoff": False, "answer": _ai_generic_fallback_reply(), "confidence": top_score, "reason": "empty_answer_fallback"}
+        return {
+            "handoff": True, 
+            "answer": "", 
+            "confidence": top_score, 
+            "reason": "empty_answer"
+        }
+    
+    # Возвращаем нормальный ответ AI
     return {
-        "handoff": handoff,
+        "handoff": False,
         "answer": answer,
         "confidence": float(parsed.get("confidence") or top_score),
-        "reason": "model_handoff" if handoff else "ok",
+        "reason": "ok",
     }
 
 
@@ -2005,6 +2212,162 @@ if VK_TOKEN and VK_GROUP_ID:
         vk = None
         longpoll = None
 
+# ====== Forum Group (Telegram Topics) ======
+_bot_user_id: Optional[int] = None  # кэш bot user id
+
+FORUM_GROUP_ID: Optional[int] = None
+_forum_group_id_raw = os.getenv("FORUM_GROUP_ID")
+if _forum_group_id_raw:
+    try:
+        FORUM_GROUP_ID = int(_forum_group_id_raw.strip())
+        logging.info("Forum group enabled: %s", FORUM_GROUP_ID)
+    except ValueError:
+        logging.error("Invalid FORUM_GROUP_ID=%r", _forum_group_id_raw)
+else:
+    logging.warning("FORUM_GROUP_ID is not set. Forum topic replies will be disabled.")
+
+# Emoji IDs для иконок топиков (Telegram custom emoji)
+FORUM_EMOJI_TELEGRAM = 5330237710655306682  # 📱 Telegram
+FORUM_EMOJI_VK = 5334853932915114338        # 📱 VK
+FORUM_EMOJI_WEB = None                       # Для сайта (нет кастомного emoji)
+
+def _forum_emoji_for_messager(messager: str) -> Optional[int]:
+    """Возвращает custom emoji ID для иконки топика по типу мессенджера"""
+    if messager == "telegram":
+        return FORUM_EMOJI_TELEGRAM
+    elif messager == "vk":
+        return FORUM_EMOJI_VK
+    return FORUM_EMOJI_WEB
+
+
+async def forum_create_topic(chat_obj) -> Optional[int]:
+    """
+    Создаёт топик в форум-группе для данного чата.
+    Возвращает message_thread_id (topic_id) или None при ошибке.
+    """
+    if not FORUM_GROUP_ID or not bot:
+        return None
+    if chat_obj.topic_id:
+        return chat_obj.topic_id  # уже создан
+
+    topic_name = (chat_obj.name or "Без имени")[:128]
+    emoji_id = _forum_emoji_for_messager(chat_obj.messager)
+
+    # Цвета для иконок топиков (fallback если нет Premium для кастомных эмодзи)
+    # Telegram = синий, VK = фиолетовый, остальное = зелёный
+    ICON_COLORS = {"telegram": 0x6FB9F0, "vk": 0xCB86DB}
+
+    try:
+        kwargs = {
+            "chat_id": FORUM_GROUP_ID,
+            "name": topic_name,
+        }
+        if emoji_id:
+            kwargs["icon_custom_emoji_id"] = str(emoji_id)
+        try:
+            topic = await bot.create_forum_topic(**kwargs)
+        except Exception as emoji_err:
+            if "PREMIUM" in str(emoji_err).upper() and emoji_id:
+                # Без Premium — используем цвет вместо кастомного эмодзи
+                kwargs.pop("icon_custom_emoji_id", None)
+                color = ICON_COLORS.get(chat_obj.messager)
+                if color:
+                    kwargs["icon_color"] = color
+                topic = await bot.create_forum_topic(**kwargs)
+            else:
+                raise emoji_err
+        topic_id = topic.message_thread_id
+
+        # Сохраняем topic_id в БД
+        async with async_session() as session:
+            await update_chat_topic_id(session, chat_obj.id, topic_id)
+        chat_obj.topic_id = topic_id
+
+        logging.info("Forum topic created: %s (id=%s) for chat %s", topic_name, topic_id, chat_obj.id)
+        return topic_id
+    except Exception as e:
+        logging.error("Failed to create forum topic for chat %s: %s", chat_obj.id, e)
+        return None
+
+
+async def forum_send_message(chat_obj, text: str, is_image: bool = False, image_caption: str = None):
+    """
+    Пересылает сообщение клиента в топик форум-группы.
+    """
+    if not FORUM_GROUP_ID or not bot:
+        return
+    topic_id = chat_obj.topic_id
+    if not topic_id:
+        topic_id = await forum_create_topic(chat_obj)
+    if not topic_id:
+        return
+
+    try:
+        source_label = chat_obj.messager.upper() if chat_obj.messager else "?"
+        header = f"[{source_label}] {chat_obj.name or 'Клиент'}:\n"
+
+        if is_image:
+            # text содержит URL картинки, возможно с caption через |
+            parts = text.split("|", 1)
+            img_url = parts[0].strip()
+            caption = parts[1].strip() if len(parts) > 1 else ""
+            full_caption = header + caption if caption else header + "📷 Фото"
+
+            # Пробуем отправить как фото по URL
+            if img_url.startswith(("http://", "https://")):
+                try:
+                    await bot.send_photo(
+                        chat_id=FORUM_GROUP_ID,
+                        message_thread_id=topic_id,
+                        photo=img_url,
+                        caption=full_caption[:1024]
+                    )
+                    return
+                except Exception:
+                    pass  # fallback к текстовому сообщению
+
+            # Если не удалось отправить как фото — отправляем текстом
+            await bot.send_message(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=topic_id,
+                text=f"{header}{caption}\n🖼 {img_url}" if caption else f"{header}📷 Фото\n🖼 {img_url}"
+            )
+        else:
+            await bot.send_message(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=topic_id,
+                text=header + text
+            )
+    except Exception as e:
+        logging.error("Failed to send message to forum topic %s: %s", topic_id, e)
+
+
+async def forum_send_photo_bytes(chat_obj, photo_data, caption: str = None):
+    """
+    Отправляет фото (bytes/BufferedInputFile) в топик форум-группы.
+    """
+    if not FORUM_GROUP_ID or not bot:
+        return
+    topic_id = chat_obj.topic_id
+    if not topic_id:
+        topic_id = await forum_create_topic(chat_obj)
+    if not topic_id:
+        return
+
+    try:
+        source_label = chat_obj.messager.upper() if chat_obj.messager else "?"
+        header = f"[{source_label}] {chat_obj.name or 'Клиент'}"
+        full_caption = f"{header}: {caption}" if caption else f"{header}: 📷 Фото"
+        await bot.send_photo(
+            chat_id=FORUM_GROUP_ID,
+            message_thread_id=topic_id,
+            photo=photo_data,
+            caption=full_caption[:1024]
+        )
+    except Exception as e:
+        logging.error("Failed to send photo to forum topic %s: %s", topic_id, e)
+
+
 # Асинхронная очередь для передачи событий из потока
 queue: asyncio.Queue = asyncio.Queue()
 
@@ -2112,6 +2475,8 @@ async def handle_single_event(event):
 
         if payload_data and isinstance(payload_data, dict) and payload_data.get("cmd"):
             cmd = str(payload_data.get("cmd"))
+            if chat.waiting and cmd != "ask_ai":
+                return
             if cmd == "home":
                 await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
                 return
@@ -2142,16 +2507,19 @@ async def handle_single_event(event):
                 category_id = str(payload_data.get("id") or "")
                 page = int(payload_data.get("page") or 1)
                 limit = 6
+                logging.info(f"VK: Opening category {category_id}, page {page}")
                 items_data = await catalog_get_products(category_id, page=page, limit=limit)
                 if not items_data:
                     reason = str(_catalog_cache.get("last_error") or "").strip()
                     text_out = "Каталог пустой или API недоступен."
                     if reason:
                         text_out += f"\nПричина: {reason}"
+                    logging.error(f"VK: Failed to get products for category {category_id}: {reason}")
                     await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                     return
                 items = items_data.get("items") or []
                 has_next = bool(items_data.get("has_next"))
+                logging.info(f"VK: Got {len(items)} products for category {category_id}")
                 await vk_send_message(peer_id, f"Каталог\n\nСтраница {page}", keyboard=vk_kb_products(category_id, page, items, has_next=has_next))
                 return
             if cmd == "prod":
@@ -2228,22 +2596,31 @@ async def handle_single_event(event):
                 return
             if cmd == "manager":
                 await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-                await vk_send_message(peer_id, "Я позвал менеджера. Напишите, что нужно — он подключится.", keyboard=vk_kb_main())
+                text_out = await _ai_handoff_reply()
+                if text_out:
+                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
                 return
 
         text_norm = _normalize(text)
         command = text_norm
+        state = _get_state("vk", str(peer_id))
+        allow_ai_during_waiting = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
+        force_ai = allow_ai_during_waiting
+        suppress_ai = False
         if command.startswith("/"):
             command = command[1:]
         if "@" in command:
             command = command.split("@", 1)[0]
-        if command in {"меню", "menu", "старт", "start"} or text_norm in {"/menu", "/start"}:
+        if not suppress_ai and (command in {"меню", "menu", "старт", "start"} or text_norm in {"/menu", "/start"}):
+            _clear_state("vk", str(peer_id))  # очищаем state при смене режима
             await vk_send_message(peer_id, _vk_main_text(), keyboard=vk_kb_main())
             return
-        if command == "faq" or "faq" in text_norm or "/faq" in text_norm:
+        if not suppress_ai and (command == "faq" or "faq" in text_norm or "/faq" in text_norm):
+            _clear_state("vk", str(peer_id))  # очищаем state при смене режима
             await vk_send_message(peer_id, _vk_faq_text(1), keyboard=vk_kb_faq_menu(1))
             return
-        if any(k in text_norm for k in {"каталог", "товары", "товар"}):
+        if not suppress_ai and any(k in text_norm for k in {"каталог", "товары", "товар"}):
+            _clear_state("vk", str(peer_id))  # очищаем state при смене режима
             categories = await catalog_get_categories()
             if not categories:
                 reason = str(_catalog_cache.get("last_error") or "").strip()
@@ -2254,9 +2631,11 @@ async def handle_single_event(event):
                 return
             await vk_send_message(peer_id, "Каталог\n\nВыберите категорию:", keyboard=vk_kb_categories(categories))
             return
-        if "позови менеджера" in text_norm or text_norm == "менеджер":
+        if not suppress_ai and ("позови менеджера" in text_norm or text_norm == "менеджер"):
             await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-            await vk_send_message(peer_id, "Я позвал менеджера. Напишите, что нужно — он подключится.", keyboard=vk_kb_main())
+            text_out = await _ai_handoff_reply()
+            if text_out:
+                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
             return
 
         # --- 2) Текстовое сообщение ---
@@ -2285,63 +2664,130 @@ async def handle_single_event(event):
             }
             await messages_manager.broadcast(json.dumps(message_for_frontend))
 
-        # Если AI выключен — включаем его при обычном сообщении
-        if not chat.ai:
-            if chat.waiting:
-                await update_chat_waiting(db=session, chat_id=chat.id, waiting=False)
-                await updates_manager.broadcast(json.dumps({
-                    "type": "chat_update",
-                    "chat_id": chat.id,
-                    "waiting": False
-                }))
-            await update_chat_ai(db=session, chat_id=chat.id, ai=True)
-            chat.ai = True
+            # Пересылаем в форум-группу
+            await forum_send_message(chat, text)
+
         state = _get_state("vk", str(peer_id))
+        text_norm = _normalize(text)
+
+        # Если ждём подтверждения на связь с менеджером
+        if state.get("handoff_pending"):
+            if _ai_is_handoff_confirm(text_norm):
+                await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+                text_out = await _ai_handoff_reply()
+                if text_out:
+                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+                state.pop("handoff_pending", None)
+                return
+            if text_norm in {"нет", "не", "не надо", "не нужно"}:
+                state.pop("handoff_pending", None)
+            # иначе продолжаем как с новым вопросом
+
+        if _ai_is_handoff_confirm(text_norm):
+            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+            text_out = await _ai_handoff_reply()
+            if text_out:
+                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+            return
+
+        if suppress_ai:
+            return
+        
+        # Проверяем, отключен ли AI для этого чата (кроме режима "спросить у ИИ" про товар)
+        is_product_mode = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
+        if not is_product_mode and (not chat.ai or chat.waiting):
+            logging.info(f"🔇 VK AI disabled for chat {chat.id}: ai={chat.ai}, waiting={chat.waiting}")
+            return
+        
         extra_context = None
         product_id = None
+        base_id = None
         categories: List[str] = []
+        logging.info(f"🔍 VK state for {peer_id}: mode={state.get('mode')}, has_product={bool(state.get('product'))}")
         if state.get("mode") == "ask_ai_product" and state.get("product"):
             p = state["product"]
-            product_id = str(p.get("base_id") or p.get("id") or "")
+            product_id = str(p.get("id") or p.get("base_id") or "")
+            base_id = str(p.get("base_id") or p.get("id") or "")
+            logging.info(f"📦 VK using product context: product_id={product_id}, base_id={base_id}, name={p.get('name')}")
             categories = p.get("categories") or []
-            if not categories and product_id:
-                categories = await catalog_get_product_categories(product_id)
+            if not categories and base_id:
+                categories = await catalog_get_product_categories(base_id)
             price_text = _format_price(p.get("price"))
-            extra_context = (
-                f"Контекст товара:\nНазвание: {p.get('name','')}\n"
-                f"Описание: {p.get('description','')}\n"
-                f"Цена: {price_text}\n"
-                f"Цвета: {', '.join(p.get('colors', []))}\n"
-                f"Категории: {', '.join(categories)}\n"
-                f"Ссылка: {p.get('url','')}"
-            )
-            _clear_state("vk", str(peer_id))
+            meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+            sections = p.get("sections") if isinstance(p.get("sections"), list) else []
+            section_lines: List[str] = []
+            for s in sections:
+                if not isinstance(s, dict):
+                    continue
+                title = str(s.get("title") or "").strip()
+                content = str(s.get("content") or "").strip()
+                if not content and not title:
+                    continue
+                content = _ai_trim(_ai_strip_html(content), 280)
+                if title:
+                    section_lines.append(f"{title}: {content}")
+                else:
+                    section_lines.append(content)
+                if len(section_lines) >= 3:
+                    break
+            ctx_lines = [
+                f"Название: {p.get('name','')}",
+                f"Описание: {p.get('description','')}",
+            ]
+            if p.get("composition"):
+                ctx_lines.append(f"Состав: {p.get('composition','')}")
+            if p.get("fit"):
+                ctx_lines.append(f"Посадка: {p.get('fit','')}")
+            if meta.get("care"):
+                ctx_lines.append(f"Уход: {meta.get('care','')}")
+            if meta.get("shipping"):
+                ctx_lines.append(f"Доставка: {meta.get('shipping','')}")
+            if meta.get("returns"):
+                ctx_lines.append(f"Возврат: {meta.get('returns','')}")
+            if section_lines:
+                ctx_lines.append(f"Дополнительно: {'; '.join(section_lines)}")
+            ctx_lines.extend([
+                f"Цена: {price_text}",
+                f"Цвета: {', '.join(p.get('colors', []))}",
+                f"Категории: {', '.join(categories)}",
+                f"Ссылка: {p.get('url','')}",
+            ])
+            extra_context = "Контекст товара:\n" + "\n".join(ctx_lines)
+            # НЕ очищаем state — сохраняем контекст товара для продолжения диалога
+            force_ai = True
         history = await get_chat_messages(session, chat.id, limit=6)
         history_text = _ai_build_history(history, max_items=6)
         previous_user_message = _ai_get_previous_user_message(history, text)
+        is_product_q = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
         ai_result = await _ai_answer_question(
             session,
             text,
             extra_context=extra_context,
             product_id=product_id,
+            product_base_id=base_id,
             product_categories=categories or None,
             conversation_history=history_text,
             previous_user_message=previous_user_message,
+            is_product_question=is_product_q,
         )
+        
+        # Если AI решил передать менеджеру - сначала спрашиваем пользователя
         if ai_result.get("handoff"):
-            reason = ai_result.get("reason")
-            if reason in {"user_request", "orders"}:
-                await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-                await vk_send_message(peer_id, _ai_handoff_reply(reason), keyboard=vk_kb_main())
-                return
-            await vk_send_message(peer_id, _ai_soft_refusal_reply(), keyboard=vk_kb_main())
+            state["handoff_pending"] = True
+            text_out = await _ai_handoff_question(text)
+            if text_out:
+                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
             return
 
+        # Если ответ пустой - тоже передаем менеджеру
         answer = str(ai_result.get("answer") or "").strip()
         answer = _normalize_price_text(answer)
+        answer = _ai_cleanup_answer(answer)
         if not answer:
-            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-            await vk_send_message(peer_id, _ai_handoff_reply(ai_result.get("reason")), keyboard=vk_kb_main())
+            state["handoff_pending"] = True
+            text_out = await _ai_handoff_question(text)
+            if text_out:
+                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
             return
 
         await asyncio.to_thread(
@@ -2372,6 +2818,17 @@ async def handle_single_event(event):
             "id": db_ans.id
         }
         await messages_manager.broadcast(json.dumps(ans_for_frontend))
+
+        # Дублируем AI-ответ в форум-топик
+        if FORUM_GROUP_ID and bot and chat.topic_id:
+            try:
+                await bot.send_message(
+                    chat_id=FORUM_GROUP_ID,
+                    message_thread_id=chat.topic_id,
+                    text=f"[AI]:\n{answer}"
+                )
+            except Exception:
+                pass
 
         # --- 4) Обработка фото-вложений ---
         for att in attachments:
@@ -2485,6 +2942,14 @@ async def handle_single_event(event):
                     "id": db_img.id,
                     "is_image": True
                 }))
+
+                # Пересылаем фото в форум-группу
+                try:
+                    photo_input = BufferedInputFile(content, filename=file_name)
+                    await forum_send_photo_bytes(chat, photo_input, caption=text or None)
+                except Exception as e:
+                    logging.error("Failed to forward VK photo to forum: %s", e)
+
                 # Обновление waiting
                 await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
                 await updates_manager.broadcast(json.dumps({
@@ -2555,6 +3020,8 @@ def build_public_minio_url(file_name: str) -> str:
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Auto-миграция: добавляем topic_id если его нет
+        await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS topic_id INTEGER"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -2763,6 +3230,72 @@ async def auth_token(username: str = Form(...), password: str = Form(...)):
     # точное совпадение с "рабочим проектом"
     return await _proxy_auth_token(username=username, password=password)
 
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    name: str = ""
+
+
+@app.post("/api/auth/register")
+async def auth_register(payload: RegisterRequest):
+    """
+    Регистрация нового менеджера через внешний сервис аутентификации.
+    """
+    url = f"{auth.AUTH_SERVICE_BASE_URL}/api/auth/register"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json={
+                    "email": payload.email,
+                    "password": payload.password,
+                    "name": payload.name,
+                    "is_admin": True,
+                },
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                content_type = resp.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    data = await resp.json()
+                    return JSONResponse(status_code=resp.status, content=data)
+                text = await resp.text()
+                return JSONResponse(status_code=resp.status, content={"detail": text})
+    except Exception as e:
+        logging.error(f"Auth register proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Auth service unavailable")
+
+
+@app.get("/api/auth/me")
+async def auth_me(request: Request):
+    """
+    Получение информации о текущем пользователе через внешний сервис аутентификации.
+    """
+    token = await auth.get_token_from_header(request)
+    if not token:
+        raise HTTPException(status_code=401, detail="Authorization header missing")
+    
+    url = f"{auth.AUTH_SERVICE_BASE_URL}/api/auth/me"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={
+                    "accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            ) as resp:
+                content_type = resp.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    data = await resp.json()
+                    return JSONResponse(status_code=resp.status, content=data)
+                text = await resp.text()
+                return JSONResponse(status_code=resp.status, content={"detail": text})
+    except Exception as e:
+        logging.error(f"Auth me proxy error: {e}")
+        raise HTTPException(status_code=502, detail="Auth service unavailable")
+
+
 @app.get("/api/chats")
 @limiter.limit("60/minute")
 async def read_chats(request: Request, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
@@ -2878,6 +3411,18 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
         "id": db_msg.id
     }
     await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+    # Если ответ менеджера — дублируем в форум-топик (чтобы видно было в группе)
+    if msg.message_type == "answer" and FORUM_GROUP_ID and bot and chat.topic_id:
+        try:
+            await bot.send_message(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=chat.topic_id,
+                text=f"[Менеджер (веб)]:\n{msg.message}"
+            )
+        except Exception as e:
+            logging.error("Failed to forward web-dashboard reply to forum: %s", e)
+
     return {"message": db_msg, "delivered": delivered, "delivery_error": delivery_error}
 
 class WaitingUpdate(BaseModel):
@@ -2951,6 +3496,24 @@ async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = De
         }
         await updates_manager.broadcast(json.dumps(update_message))
     return result
+
+@app.delete("/api/messages/{message_id}")
+async def delete_message_endpoint(message_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    result = await db.execute(select(Message).where(Message.id == message_id))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    chat_id = msg.chat_id
+    await db.delete(msg)
+    await db.commit()
+    # Уведомляем фронтенды об удалении сообщения
+    update_message = {
+        "type": "message_deleted",
+        "chatId": str(chat_id),
+        "messageId": message_id
+    }
+    await updates_manager.broadcast(json.dumps(update_message))
+    return {"success": True}
 
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
@@ -3069,6 +3632,16 @@ async def close_chat_endpoint(
     
     # Закрываем диалог
     close_result = await close_chat_dialog(db, chat_id)
+    await update_chat_waiting(db=db, chat_id=chat_id, waiting=False)
+    updated_chat = await update_chat_ai(db=db, chat_id=chat_id, ai=True)
+    if updated_chat:
+        await updates_manager.broadcast(json.dumps({
+            "type": "chat_update",
+            "chat_id": chat_id,
+            "waiting": updated_chat.waiting,
+            "ai": updated_chat.ai,
+            "dialog_status": updated_chat.dialog_status
+        }))
     
     if analysis_result:
         # Вычисляем длительность диалога
@@ -3332,6 +3905,19 @@ async def upload_image(
     }
     await messages_manager.broadcast(json.dumps(message_for_frontend))
 
+    # 8. Дублируем фото в форум-топик (ответ менеджера с веб-дашборда)
+    if FORUM_GROUP_ID and bot and chat.topic_id:
+        try:
+            photo_input = BufferedInputFile(content, filename=file_name)
+            await bot.send_photo(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=chat.topic_id,
+                photo=photo_input,
+                caption="[Менеджер (веб)]: 📷 Фото"
+            )
+        except Exception as e:
+            logging.error("Failed to forward web-dashboard photo to forum: %s", e)
+
     return {"message": db_img, "delivered": delivered, "delivery_error": delivery_error}
 
 @app.get("/api/ai/context")
@@ -3386,6 +3972,222 @@ async def get_ai_status(_: bool = Depends(auth.require_auth)):
 @app.post("/api/ai/reindex")
 async def reindex_ai(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     return await _ai_reindex(db)
+
+
+
+def _is_forum_group(message: types.Message) -> bool:
+    """Проверяет, что сообщение пришло из нашей форум-группы"""
+    return bool(FORUM_GROUP_ID and message.chat and message.chat.id == FORUM_GROUP_ID)
+
+@dp.message(lambda m: _is_forum_group(m) and m.text and m.message_thread_id)
+async def handle_forum_text_reply(message: types.Message):
+    """Менеджер ответил текстом в топике форум-группы → пересылаем клиенту"""
+    global _bot_user_id
+    if bot and not _bot_user_id:
+        _bot_user_id = (await bot.get_me()).id
+    if message.from_user and message.from_user.id == _bot_user_id:
+        return
+
+    topic_id = message.message_thread_id
+    text = message.text
+
+    async with async_session() as session:
+        chat = await get_chat_by_topic_id(session, topic_id)
+        if not chat:
+            await message.reply("⚠️ Не найден клиент для этого топика.")
+            return
+
+        # Сохраняем сообщение менеджера в БД
+        db_msg = await create_message(
+            db=session,
+            chat_id=chat.id,
+            message=text,
+            message_type="answer",
+            ai=False
+        )
+
+        # Отправляем клиенту
+        delivered = True
+        delivery_error = None
+        try:
+            if chat.messager == "telegram":
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                await bot.send_message(chat_id=tg_chat_id, text=text)
+            elif chat.messager == "vk":
+                if vk:
+                    await asyncio.to_thread(
+                        vk.messages.send,
+                        peer_id=int(chat.uuid),
+                        message=text,
+                        random_id=0
+                    )
+                else:
+                    delivered = False
+                    delivery_error = "VK not configured"
+            else:
+                delivered = False
+                delivery_error = f"Unknown messager: {chat.messager}"
+        except Exception as e:
+            delivered = False
+            delivery_error = str(e)
+            logging.error("Forum reply delivery error (chat %s, %s): %s", chat.id, chat.messager, e)
+
+        # Снимаем waiting, обновляем фронт
+        await update_chat_waiting(session, chat.id, False)
+        stats = await get_stats(session)
+
+        await updates_manager.broadcast(json.dumps({
+            "type": "chat_update",
+            "chat_id": chat.id,
+            "waiting": False
+        }))
+        await updates_manager.broadcast(json.dumps({
+            "type": "stats_update",
+            "total": stats["total"],
+            "pending": stats["pending"],
+            "ai": stats["ai"]
+        }))
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(db_msg.chat_id),
+            "content": db_msg.message,
+            "message_type": db_msg.message_type,
+            "ai": db_msg.ai,
+            "timestamp": db_msg.created_at.isoformat(),
+            "id": db_msg.id
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        status_icon = "✅" if delivered else "⚠️"
+        err_detail = f" ({delivery_error})" if delivery_error else ""
+        await message.reply(f"{status_icon} Доставлено клиенту ({chat.messager.upper()}){err_detail}")
+
+
+@dp.message(lambda m: _is_forum_group(m) and m.photo and m.message_thread_id)
+async def handle_forum_photo_reply(message: types.Message):
+    """Менеджер отправил фото в топике форум-группы → пересылаем клиенту"""
+    global _bot_user_id
+    if bot and not _bot_user_id:
+        _bot_user_id = (await bot.get_me()).id
+    if message.from_user and message.from_user.id == _bot_user_id:
+        return
+
+    topic_id = message.message_thread_id
+
+    async with async_session() as session:
+        chat = await get_chat_by_topic_id(session, topic_id)
+        if not chat:
+            await message.reply("⚠️ Не найден клиент для этого топика.")
+            return
+
+        # Скачиваем фото
+        photo = message.photo[-1]
+        file = await bot.get_file(photo.file_id)
+        file_data = await bot.download_file(file.file_path)
+        content = file_data.read() if hasattr(file_data, 'read') else file_data
+
+        # Сохраняем в MinIO
+        file_ext = os.path.splitext(file.file_path)[1] or ".jpg"
+        file_name = f"forum-{chat.id}-{int(datetime.utcnow().timestamp())}{file_ext}"
+        try:
+            minio_client.put_object(
+                bucket_name=BUCKET_NAME,
+                object_name=file_name,
+                data=io.BytesIO(content),
+                length=len(content),
+                content_type="image/jpeg"
+            )
+            image_url = build_public_minio_url(file_name)
+        except Exception as e:
+            logging.error("MinIO upload error in forum photo: %s", e)
+            await message.reply("⚠️ Не удалось загрузить фото.")
+            return
+
+        caption = message.caption or ""
+        message_content = f"{image_url}|{caption}" if caption else image_url
+
+        db_msg = crud.Message(
+            chat_id=chat.id,
+            message=message_content,
+            message_type="answer",
+            ai=False,
+            created_at=datetime.utcnow(),
+            is_image=True
+        )
+        session.add(db_msg)
+        await session.commit()
+        await session.refresh(db_msg)
+
+        # Отправляем клиенту
+        delivered = True
+        delivery_error = None
+        try:
+            if chat.messager == "telegram":
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                photo_input = BufferedInputFile(content, filename=file_name)
+                await bot.send_photo(chat_id=tg_chat_id, photo=photo_input, caption=caption or None)
+            elif chat.messager == "vk":
+                if vk:
+                    upload_url_resp = await asyncio.to_thread(vk.photos.getMessagesUploadServer)
+                    upload_url = upload_url_resp['upload_url']
+                    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+                    try:
+                        form = aiohttp.FormData()
+                        form.add_field('photo', content, filename='photo.jpg')
+                        async with current_session.post(upload_url, data=form) as resp:
+                            upload_result = await resp.json()
+                    finally:
+                        if current_session != http_session:
+                            await current_session.close()
+                    photo_data = await asyncio.to_thread(
+                        vk.photos.saveMessagesPhoto,
+                        photo=upload_result['photo'],
+                        server=upload_result['server'],
+                        hash=upload_result['hash']
+                    )
+                    await asyncio.to_thread(
+                        vk.messages.send,
+                        peer_id=int(chat.uuid),
+                        attachment=f"photo{photo_data[0]['owner_id']}_{photo_data[0]['id']}",
+                        message=caption or "",
+                        random_id=0
+                    )
+                else:
+                    delivered = False
+                    delivery_error = "VK not configured"
+        except Exception as e:
+            delivered = False
+            delivery_error = str(e)
+            logging.error("Forum photo delivery error (chat %s, %s): %s", chat.id, chat.messager, e)
+
+        # Обновляем фронт
+        await update_chat_waiting(session, chat.id, False)
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(db_msg.chat_id),
+            "content": db_msg.message,
+            "message_type": db_msg.message_type,
+            "ai": db_msg.ai,
+            "timestamp": db_msg.created_at.isoformat(),
+            "id": db_msg.id,
+            "is_image": True
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        status_icon = "✅" if delivered else "⚠️"
+        err_detail = f" ({delivery_error})" if delivery_error else ""
+        await message.reply(f"{status_icon} Фото доставлено клиенту ({chat.messager.upper()}){err_detail}")
+
+
+@dp.message(lambda m: _is_forum_group(m))
+async def handle_forum_ignore(message: types.Message):
+    """Все остальные сообщения в форум-группе — игнорируем (не обрабатываем как клиентские)"""
+    return
+
+
+# ===================== END FORUM GROUP HANDLERS =====================
 
 @dp.message(Command("reindex"))
 async def cmd_reindex(message: Message):
@@ -3705,7 +4507,9 @@ async def handle_menu_callback(callback: types.CallbackQuery):
                     }
                 }))
             await request_manager(session, chat.id, str(callback.message.chat.id), callback.from_user.first_name or str(callback.message.chat.id), "telegram")
-        await callback.message.answer("Я позвал менеджера. Напишите, что нужно — он подключится.", reply_markup=tg_kb_main())
+        text_out = await _ai_handoff_reply()
+        if text_out:
+            await callback.message.answer(text_out, reply_markup=tg_kb_main())
         return
 
 @dp.callback_query(lambda c: c.data.startswith("notifications_"))
@@ -3776,13 +4580,20 @@ async def handle_message(message: Message):
             await updates_manager.broadcast(json.dumps(new_chat_message))
 
         text_norm = _normalize(message.text)
-        if text_norm in {"меню", "/menu", "menu"}:
+        state = _get_state("tg", str(message.chat.id))
+        allow_ai_during_waiting = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
+        suppress_ai = False
+
+        if not suppress_ai and text_norm in {"меню", "/menu", "menu"}:
+            _clear_state("tg", str(message.chat.id))  # очищаем state при смене режима
             await message.answer(_tg_main_text(), reply_markup=tg_kb_main(), parse_mode="HTML")
             return
-        if text_norm in {"faq", "/faq"}:
+        if not suppress_ai and text_norm in {"faq", "/faq"}:
+            _clear_state("tg", str(message.chat.id))  # очищаем state при смене режима
             await message.answer(_tg_faq_text(1), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
             return
-        if text_norm in {"каталог", "товары", "товар"}:
+        if not suppress_ai and text_norm in {"каталог", "товары", "товар"}:
+            _clear_state("tg", str(message.chat.id))  # очищаем state при смене режима
             categories = await catalog_get_categories()
             if not categories:
                 await message.answer("<b>Каталог</b>\n<blockquote>Пока недоступен</blockquote>", parse_mode="HTML", reply_markup=tg_kb_main())
@@ -3804,28 +4615,83 @@ async def handle_message(message: Message):
             await message.answer("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", parse_mode="HTML", reply_markup=_tg_kb(rows))
             return
 
-        force_manager = "позови менеджера" in text_norm or text_norm == "менеджер"
-        state = _get_state("tg", str(message.chat.id))
+        # Если ждём подтверждения на связь с менеджером
+        if state.get("handoff_pending"):
+            if _ai_is_handoff_confirm(text_norm):
+                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+                text_out = await _ai_handoff_reply()
+                if text_out:
+                    await message.answer(text_out, reply_markup=tg_kb_main())
+                state.pop("handoff_pending", None)
+                return
+            if text_norm in {"нет", "не", "не надо", "не нужно"}:
+                state.pop("handoff_pending", None)
+            # иначе продолжаем как с новым вопросом
+
+        if _ai_is_handoff_confirm(text_norm):
+            await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+            text_out = await _ai_handoff_reply()
+            if text_out:
+                await message.answer(text_out, reply_markup=tg_kb_main())
+            return
+
+        force_manager = not suppress_ai and ("позови менеджера" in text_norm or text_norm == "менеджер")
         extra_context = None
         product_id = None
+        base_id = None
         categories: List[str] = []
         force_ai = False
+        logging.info(f"🔍 TG state for {message.chat.id}: mode={state.get('mode')}, has_product={bool(state.get('product'))}")
         if state.get("mode") == "ask_ai_product" and state.get("product"):
             p = state["product"]
-            product_id = str(p.get("base_id") or p.get("id") or "")
+            product_id = str(p.get("id") or p.get("base_id") or "")
+            base_id = str(p.get("base_id") or p.get("id") or "")
+            logging.info(f"📦 TG using product context: product_id={product_id}, base_id={base_id}, name={p.get('name')}")
             categories = p.get("categories") or []
-            if not categories and product_id:
-                categories = await catalog_get_product_categories(product_id)
+            if not categories and base_id:
+                categories = await catalog_get_product_categories(base_id)
             price_text = _format_price(p.get("price"))
-            extra_context = (
-                f"Контекст товара:\nНазвание: {p.get('name','')}\n"
-                f"Описание: {p.get('description','')}\n"
-                f"Цена: {price_text}\n"
-                f"Цвета: {', '.join(p.get('colors', []))}\n"
-                f"Категории: {', '.join(categories)}\n"
-                f"Ссылка: {p.get('url','')}"
-            )
-            _clear_state("tg", str(message.chat.id))
+            meta = p.get("meta") if isinstance(p.get("meta"), dict) else {}
+            sections = p.get("sections") if isinstance(p.get("sections"), list) else []
+            section_lines: List[str] = []
+            for s in sections:
+                if not isinstance(s, dict):
+                    continue
+                title = str(s.get("title") or "").strip()
+                content = str(s.get("content") or "").strip()
+                if not content and not title:
+                    continue
+                content = _ai_trim(_ai_strip_html(content), 280)
+                if title:
+                    section_lines.append(f"{title}: {content}")
+                else:
+                    section_lines.append(content)
+                if len(section_lines) >= 3:
+                    break
+            ctx_lines = [
+                f"Название: {p.get('name','')}",
+                f"Описание: {p.get('description','')}",
+            ]
+            if p.get("composition"):
+                ctx_lines.append(f"Состав: {p.get('composition','')}")
+            if p.get("fit"):
+                ctx_lines.append(f"Посадка: {p.get('fit','')}")
+            if meta.get("care"):
+                ctx_lines.append(f"Уход: {meta.get('care','')}")
+            if meta.get("shipping"):
+                ctx_lines.append(f"Доставка: {meta.get('shipping','')}")
+            if meta.get("returns"):
+                ctx_lines.append(f"Возврат: {meta.get('returns','')}")
+            if section_lines:
+                ctx_lines.append(f"Дополнительно: {'; '.join(section_lines)}")
+            ctx_lines.extend([
+                f"Цена: {price_text}",
+                f"Цвета: {', '.join(p.get('colors', []))}",
+                f"Категории: {', '.join(categories)}",
+                f"Ссылка: {p.get('url','')}",
+            ])
+            extra_context = "Контекст товара:\n" + "\n".join(ctx_lines)
+            # НЕ очищаем state — сохраняем контекст товара для продолжения диалога
             force_ai = True
 
         new_message = Message(
@@ -3850,6 +4716,9 @@ async def handle_message(message: Message):
         }
         await messages_manager.broadcast(json.dumps(message_for_frontend))
 
+        # Пересылаем в форум-группу
+        await forum_send_message(chat, message.text)
+
         if force_manager:
             await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
             await update_chat_ai(db=session, chat_id=chat.id, ai=False)
@@ -3866,47 +4735,55 @@ async def handle_message(message: Message):
                     chat_name=message.chat.first_name or str(message.chat.id),
                     messager="telegram"
                 )
-            await message.answer("Я позвал менеджера. Напишите, что нужно — он подключится.", reply_markup=tg_kb_main())
+            text_out = await _ai_handoff_reply()
+            if text_out:
+                await message.answer(text_out, reply_markup=tg_kb_main())
             return
 
-        if not chat.ai and not force_ai:
-            if chat.waiting:
-                await update_chat_waiting(db=session, chat_id=chat.id, waiting=False)
-                update_message = {
-                    "type": "chat_update",
-                    "chat_id": chat.id,
-                    "waiting": False
-                }
-                await updates_manager.broadcast(json.dumps(update_message))
-            await update_chat_ai(db=session, chat_id=chat.id, ai=True)
-            chat.ai = True
+        if suppress_ai:
+            return
+        
+        # Проверяем, отключен ли AI для этого чата (кроме режима "спросить у ИИ" про товар)
+        is_product_mode = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
+        if not is_product_mode and (not chat.ai or chat.waiting):
+            logging.info(f"🔇 TG AI disabled for chat {chat.id}: ai={chat.ai}, waiting={chat.waiting}")
+            return
         
         try:
             history = await get_chat_messages(session, chat.id, limit=6)
             history_text = _ai_build_history(history, max_items=6)
+            is_product_q = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
             ai_result = await _ai_answer_question(
                 session,
                 message.text,
                 extra_context=extra_context,
                 product_id=product_id,
+                product_base_id=base_id,
                 product_categories=categories or None,
                 conversation_history=history_text,
                 previous_user_message=_ai_get_previous_user_message(history, message.text),
+                is_product_question=is_product_q,
             )
+            
+            # Если AI решил передать менеджеру - сначала спрашиваем пользователя
             if ai_result.get("handoff"):
-                reason = ai_result.get("reason")
-                if reason in {"user_request", "orders"}:
-                    await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
-                    await message.answer(_ai_handoff_reply(reason), reply_markup=tg_kb_main())
-                    return
-                await message.answer(_ai_soft_refusal_reply(), reply_markup=tg_kb_main())
+                state = _get_state("tg", str(message.chat.id))
+                state["handoff_pending"] = True
+                text_out = await _ai_handoff_question(message.text)
+                if text_out:
+                    await message.answer(text_out, reply_markup=tg_kb_main())
                 return
 
+            # Если ответ пустой - тоже передаем менеджеру
             answer = str(ai_result.get("answer") or "").strip()
             answer = _normalize_price_text(answer)
+            answer = _ai_cleanup_answer(answer)
             if not answer:
-                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
-                await message.answer(_ai_handoff_reply(ai_result.get("reason")), reply_markup=tg_kb_main())
+                state = _get_state("tg", str(message.chat.id))
+                state["handoff_pending"] = True
+                text_out = await _ai_handoff_question(message.text)
+                if text_out:
+                    await message.answer(text_out, reply_markup=tg_kb_main())
                 return
 
             await message.answer(answer)
@@ -3930,6 +4807,17 @@ async def handle_message(message: Message):
                 "id": new_answer.id
             }
             await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+            # Дублируем AI-ответ в форум-топик
+            if FORUM_GROUP_ID and bot and chat.topic_id:
+                try:
+                    await bot.send_message(
+                        chat_id=FORUM_GROUP_ID,
+                        message_thread_id=chat.topic_id,
+                        text=f"[AI]:\n{answer}"
+                    )
+                except Exception:
+                    pass
         except Exception as e:
             logging.error(f"Error processing message: {e}")
             await message.answer("Извините, произошла ошибка при обработке запроса")
@@ -3937,6 +4825,10 @@ async def handle_message(message: Message):
 
 @dp.message(F.photo)
 async def handle_photos(message: types.Message):
+    # Игнорируем фото из форум-группы (обрабатываются отдельным хендлером)
+    if _is_forum_group(message):
+        return
+
     # Берем фото с самым высоким разрешением
     photo = message.photo[-1]
     
@@ -3961,9 +4853,16 @@ async def handle_photos(message: types.Message):
         async with async_session() as session:
             # Создаем сообщение в базе данных
             chat = await get_chat_by_uuid(session, str(message.chat.id))
+            if not chat:
+                chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+            
+            # Формируем контент: URL картинки и подпись через разделитель |
+            image_url = build_public_minio_url(file_name)
+            message_content = f"{image_url}|{message.caption}" if message.caption else image_url
+
             new_message = Message(
                 chat_id=chat.id,
-                message=build_public_minio_url(file_name),
+                message=message_content,
                 message_type="question",
                 ai=False,
                 created_at=datetime.utcnow(),
@@ -3983,6 +4882,15 @@ async def handle_photos(message: types.Message):
                 "is_image": new_message.is_image
             }
             await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+            # Пересылаем фото в форум-группу
+            try:
+                file_data_for_forum = await bot.download_file(file.file_path)
+                content_bytes = file_data_for_forum.read() if hasattr(file_data_for_forum, 'read') else file_data_for_forum
+                photo_input = BufferedInputFile(content_bytes, filename=file_name)
+                await forum_send_photo_bytes(chat, photo_input, caption=message.caption)
+            except Exception as e:
+                logging.error("Failed to forward TG photo to forum: %s", e)
 
             update_message = {
                 "type": "chat_update",

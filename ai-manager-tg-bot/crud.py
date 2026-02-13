@@ -47,6 +47,7 @@ class Chat(Base):
     tags = Column(ARRAY(String), default=[])
     name = Column(String(30), default="Не известно")
     messager = Column(String(16), nullable=False, default="telegram")
+    topic_id = Column(Integer, nullable=True)  # Forum topic ID for Telegram group
     # Поля для аналитики и назначения менеджера
     assigned_manager_id = Column(Integer, nullable=True)
     assigned_manager_name = Column(String(100), nullable=True)
@@ -349,6 +350,20 @@ async def remove_chat_tag(db: AsyncSession, chat_id: int, tag: str) -> dict:
         await db.rollback()
         return {"message": "error"}
 
+async def get_chat_by_topic_id(db: AsyncSession, topic_id: int):
+    """Получает чат по ID топика в форум-группе Telegram"""
+    result = await db.execute(select(Chat).filter(Chat.topic_id == topic_id))
+    return result.scalar_one_or_none()
+
+async def update_chat_topic_id(db: AsyncSession, chat_id: int, topic_id: int):
+    """Сохраняет topic_id форум-группы для чата"""
+    chat = await get_chat(db, chat_id)
+    if chat:
+        chat.topic_id = topic_id
+        await db.commit()
+        await db.refresh(chat)
+    return chat
+
 async def sync_vk(db: AsyncSession, chat_id: int) -> dict:
     """
     Синхронизирует VK чат с базой данных.
@@ -606,12 +621,15 @@ async def assign_chat_to_manager(db: AsyncSession, chat_id: int, manager_id: int
 
 
 async def close_chat_dialog(db: AsyncSession, chat_id: int) -> Optional[Dict[str, Any]]:
-    """Закрывает диалог (меняет статус на closed)"""
+    """Закрывает диалог (меняет статус на closed) и снимает привязку менеджера"""
     chat = await get_chat(db, chat_id)
     if not chat:
         return None
     
     chat.dialog_status = "closed"
+    chat.assigned_manager_id = None
+    chat.assigned_manager_name = None
+    chat.assigned_at = None
     await db.commit()
     await db.refresh(chat)
     

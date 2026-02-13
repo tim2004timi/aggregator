@@ -18,18 +18,18 @@ const Index = () => {
   };
 
   return (
-    <div className="h-screen flex flex-col">
+    <div className="h-[100dvh] flex flex-col overflow-hidden">
       {/* Mobile Back Button - Fixed at the top */}
       {selectedChat && (
-        <div className="md:hidden fixed top-0 left-0 right-0 z-50 bg-white border-b border-gray-200">
+        <div className="md:hidden flex-shrink-0 bg-white border-b border-gray-200">
           <Button
             variant="ghost"
             size="sm"
             onClick={() => selectChat(null)}
-            className="w-full justify-start px-4 py-2 text-gray-700 hover:bg-gray-100"
+            className="w-full justify-start px-4 py-3 text-gray-700 hover:bg-gray-100"
           >
             <ArrowLeft size={16} className="mr-2" />
-            Back to Chats
+            Назад к чатам
           </Button>
         </div>
       )}
@@ -46,7 +46,7 @@ const Index = () => {
         </div>
         
         {/* Main Content - full width on mobile when chat is selected */}
-        <div className={`w-full md:w-2/3 lg:w-7/10 flex-1 border-l border-gray-200 ${!selectedChat ? 'hidden md:block' : 'block'} ${selectedChat ? 'mt-12 md:mt-0' : ''}`}>
+        <div className={`w-full md:w-2/3 lg:w-7/10 flex-1 border-l border-gray-200 ${!selectedChat ? 'hidden md:block' : 'block'} flex flex-col overflow-hidden`}>
           <ChatView 
             chatId={selectedChat?.id || null}
             onChatDeleted={handleChatDeleted}

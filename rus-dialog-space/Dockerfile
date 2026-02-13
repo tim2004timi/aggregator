@@ -7,6 +7,9 @@ RUN npm install
 
 COPY . .
 
+# Fix vite permissions
+RUN chmod -R +x node_modules/.bin
+
 # Don't set VITE_WS_URL and VITE_API_URL to use dynamic window.location
 RUN npm run build
 

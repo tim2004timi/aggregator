@@ -38,6 +38,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o-mini}
       - OPENAI_TIMEOUT=${OPENAI_TIMEOUT:-30}
+      - FORUM_GROUP_ID=${FORUM_GROUP_ID}
     networks:
       - app_network
     volumes:
@@ -86,31 +87,9 @@ services:
       timeout: 5s
       retries: 5
 
-  n8n:
-    image: n8nio/n8n:latest
-    container_name: n8n
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "127.0.0.1:5678:5678"
-    environment:
-      - N8N_HOST=localhost
-      - N8N_PORT=5678
-      - N8N_PROTOCOL=http
-      - N8N_SECURE_COOKIE=false
-      - N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true
-      - N8N_RUNNERS_ENABLED=true
-    volumes:
-      - n8n_data:/home/node/.n8n
-    networks:
-      - app_network
-    restart: unless-stopped
-
 volumes:
   minio_data:
   postgres_data:
-  n8n_data:
 
 networks:
   app_network:

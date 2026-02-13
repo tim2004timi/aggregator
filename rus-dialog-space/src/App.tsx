@@ -7,9 +7,11 @@ import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { WebSocketProvider } from './contexts/WebSocketContext';
 import { ChatProvider } from './contexts/ChatContext';
 import Index from "./pages/Index";
+import TestIndex from "./pages/TestIndex";
 import NotFound from "./pages/NotFound";
 import MessageBox from "./pages/MessageBox";
 import Login from "./pages/Login";
+import Register from "./pages/Register";
 import AiChats from "./pages/AiChats";
 import Analytics from "./pages/Analytics";
 
@@ -100,9 +102,11 @@ const App = () => {
             <BrowserRouter>
               <Routes>
                 <Route path="/" element={<RequireAuth><Index /></RequireAuth>} />
+                <Route path="/test" element={<RequireAuth><TestIndex /></RequireAuth>} />
                 <Route path="/ai-chats" element={<RequireAuth><AiChats /></RequireAuth>} />
                 <Route path="/analytics" element={<RequireAuth><Analytics /></RequireAuth>} />
                 <Route path="/login" element={<RedirectIfAuthed><Login /></RedirectIfAuthed>} />
+                <Route path="/register" element={<RedirectIfAuthed><Register /></RedirectIfAuthed>} />
                 <Route path="/message-box" element={<RequireAuth><MessageBox /></RequireAuth>} />
                 {/* ADD ALL CUSTOM ROUTES ABOVE THE CATCH-ALL "*" ROUTE */}
                 <Route path="*" element={<NotFound />} />

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Chat, getChats } from '@/lib/api';
+import { Chat, getChats, getCurrentUser, User } from '@/lib/api';
 import { CircleDot, MessageSquare, Send, Search } from 'lucide-react';
 import { useWebSocket } from '@/contexts/WebSocketContext';
 import { useChat } from '@/contexts/ChatContext';
@@ -54,31 +54,31 @@ const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
     <div className="h-full flex flex-col bg-white border-r border-gray-200">
       {/* Chat List Header */}
       <div className="p-4 border-b border-gray-200">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <h2 className="text-lg font-semibold text-gray-800">Сообщения</h2>
-          <div className="relative w-40">
+          <div className="relative w-full sm:w-48">
             <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 text-gray-400" size={16} />
             <Input
               type="text"
-              placeholder="Поиск по чатам и тегам..."
+              placeholder="Поиск..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              className="pl-9 w-full"
+              className="pl-9 w-full h-9"
             />
           </div>
         </div>
       </div>
       
       {/* Chat List */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto scrolling-touch">
         {loading ? (
           <div className="p-4 text-center text-gray-500">Загрузка чатов...</div>
         ) : (
-          <>
+          <div className="flex flex-col">
             {/* Waiting Response Section */}
             {waitingChats.length > 0 && (
               <div>
-                <div className="px-4 py-2 bg-gray-100 text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200">
+                <div className="px-4 py-2 bg-gray-100 text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200">
                   Ожидают ответа
                 </div>
                 
@@ -99,7 +99,7 @@ const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
             {/* Regular Chats Section */}
             <div>
               {waitingChats.length > 0 && (
-                <div className="px-4 py-2 bg-gray-100 text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200">
+                <div className="px-4 py-2 bg-gray-100 text-[10px] sm:text-xs font-medium text-gray-500 uppercase tracking-wider border-b border-gray-200">
                   Все сообщения
                 </div>
               )}
@@ -120,7 +120,7 @@ const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
             {filteredChats.length === 0 && (
               <div className="p-4 text-center text-gray-500">Нет доступных чатов</div>
             )}
-          </>
+          </div>
         )}
       </div>
     </div>

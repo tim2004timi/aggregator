@@ -57,9 +57,12 @@ const ChatPreview = ({ chat, isSelected, onClick }: ChatPreviewProps) => {
       
       <div className="flex-1 min-w-0">
         <div className="flex justify-between items-center">
-          <h3 className="text-sm font-medium text-gray-900 truncate">
-            {chat.name || `Чат #${chat.uuid}`}
-          </h3>
+          <div className="flex items-center gap-2 min-w-0">
+            <h3 className="text-sm font-medium text-gray-900 truncate">
+              {chat.name || 'Чат'}
+            </h3>
+            <span className="text-xs text-gray-400 flex-shrink-0">№{chat.id}</span>
+          </div>
           <span className="text-xs text-gray-500">
             {chat.lastMessageTime && formatTime(chat.lastMessageTime)}
           </span>

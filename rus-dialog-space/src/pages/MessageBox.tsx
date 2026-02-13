@@ -1,41 +1,29 @@
 import { useState, useEffect } from 'react';
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Input } from "@/components/ui/input";
 import { useNavigate } from "react-router-dom";
-import { getAiSettings, putAiSettings, reindexAi, getAiStatus } from '@/lib/api';
+import { getAiSettings, putAiSettings, reindexAi } from '@/lib/api';
 import { toast } from '@/components/ui/sonner';
+import { ArrowLeft, Brain, Database, Sparkles } from 'lucide-react';
 
 const MessageBox = () => {
   const navigate = useNavigate();
   const [systemMessage, setSystemMessage] = useState('');
-  const [faqs, setFaqs] = useState('');
-  const [rules, setRules] = useState('');
-  const [tone, setTone] = useState('');
   const [handoffPhrases, setHandoffPhrases] = useState('');
-  const [minScore, setMinScore] = useState(0.2);
   const [sitePages, setSitePages] = useState('');
-  const [autoRefreshMinutes, setAutoRefreshMinutes] = useState(0);
-  const [status, setStatus] = useState<{ last_indexed?: string; last_error?: string; chunks?: number }>({});
   const [loading, setLoading] = useState(true);
+  const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
     const fetchContext = async () => {
       try {
         const data = await getAiSettings();
         setSystemMessage(data.system_message || '');
-        setFaqs(data.faqs || '');
-        setRules(data.rules || '');
-        setTone(data.tone || '');
         setHandoffPhrases(data.handoff_phrases || '');
-        setMinScore(typeof data.min_score === 'number' ? data.min_score : 0.2);
         setSitePages(data.site_pages || '');
-        setAutoRefreshMinutes(typeof data.auto_refresh_minutes === 'number' ? data.auto_refresh_minutes : 0);
-        const s = await getAiStatus();
-        setStatus(s || {});
       } catch (error) {
         console.error('Failed to fetch AI context:', error);
-        toast.error('Не удалось загрузить контекст ИИ.');
+        toast.error('Не удалось загрузить настройки ИИ.');
       } finally {
         setLoading(false);
       }
@@ -44,177 +32,118 @@ const MessageBox = () => {
   }, []);
 
   const handleSubmit = async () => {
+    setIsSaving(true);
     try {
       await putAiSettings({
         system_message: systemMessage,
-        faqs,
-        rules,
-        tone,
         handoff_phrases: handoffPhrases,
-        min_score: Number(minScore),
         site_pages: sitePages,
-        auto_refresh_minutes: Number(autoRefreshMinutes),
       });
-      toast.success('Настройки ИИ успешно обновлены!');
-      const s = await getAiStatus();
-      setStatus(s || {});
+      await reindexAi();
+      toast.success('Настройки ИИ сохранены и база знаний обновлена');
     } catch (error) {
       console.error('Failed to send data:', error);
-      toast.error('Не удалось отправить данные.');
+      toast.error('Не удалось сохранить настройки');
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleReindex = async () => {
-    try {
-      const result = await reindexAi();
-      if (result.ok) {
-        toast.success(`Индекс обновлен (${result.chunks || 0} фрагментов)`);
-      } else {
-        toast.error(result.error || 'Не удалось обновить индекс');
-      }
-      const s = await getAiStatus();
-      setStatus(s || {});
-    } catch (error) {
-      console.error('Reindex error:', error);
-      toast.error('Не удалось обновить индекс.');
-    }
-  };
-
-  return (
-    <div className="container mx-auto px-4 py-8 max-w-4xl">
-      <div className="flex flex-col gap-6">
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold">Добавить контекст для ИИ</h1>
-          <Button
-            variant="outline"
-            onClick={() => navigate("/")}
-            className="hover:bg-gray-100"
-          >
-            Назад
-          </Button>
-        </div>
-        
-        <div className="space-y-8">
-          {/* AI Context Section */}
-          <div className="space-y-4">
-            <label className="text-sm font-medium text-gray-700">Контекст ИИ</label>
-            {loading ? (
-              <div className="text-center text-gray-500">Загрузка контекста...</div>
-            ) : (
-              <Textarea
-                placeholder="Введите контекст для ИИ..."
-                className="min-h-[300px] p-4 text-base border-gray-200 focus:border-gray-400 focus:ring-gray-400"
-                value={systemMessage}
-                onChange={(e) => setSystemMessage(e.target.value)}
-              />
-            )}
-          </div>
-
-          {/* FAQs Section */}
-          <div className="space-y-4">
-            <label className="text-sm font-medium text-gray-700">Часто задаваемые вопросы</label>
-            <Textarea
-              placeholder="Введите часто задаваемые вопросы..."
-              className="min-h-[200px] p-4 text-base border-gray-200 focus:border-gray-400 focus:ring-gray-400"
-              value={faqs}
-              onChange={(e) => setFaqs(e.target.value)}
-            />
-          </div>
-
-          <div className="space-y-4">
-            <label className="text-sm font-medium text-gray-700">Правила ответа</label>
-            <Textarea
-              placeholder="Правила, ограничения, условия передачи менеджеру..."
-              className="min-h-[180px] p-4 text-base border-gray-200 focus:border-gray-400 focus:ring-gray-400"
-              value={rules}
-              onChange={(e) => setRules(e.target.value)}
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Тон общения</label>
-              <Input
-                placeholder="дружелюбный, лаконичный"
-                value={tone}
-                onChange={(e) => setTone(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Минимальная уверенность (0–1)</label>
-              <Input
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={minScore}
-                onChange={(e) => setMinScore(Number(e.target.value))}
-              />
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            <label className="text-sm font-medium text-gray-700">Фразы для передачи менеджеру (по одной в строке)</label>
-            <Textarea
-              placeholder="хочу человека&#10;менеджер&#10;не бот"
-              className="min-h-[140px] p-4 text-base border-gray-200 focus:border-gray-400 focus:ring-gray-400"
-              value={handoffPhrases}
-              onChange={(e) => setHandoffPhrases(e.target.value)}
-            />
-          </div>
-
-          <div className="space-y-4">
-            <label className="text-sm font-medium text-gray-700">Страницы сайта для парсинга (URL, по одной в строке)</label>
-            <Textarea
-              placeholder="https://site.ru/delivery&#10;https://site.ru/returns"
-              className="min-h-[140px] p-4 text-base border-gray-200 focus:border-gray-400 focus:ring-gray-400"
-              value={sitePages}
-              onChange={(e) => setSitePages(e.target.value)}
-            />
-          </div>
-
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Автообновление базы (минуты)</label>
-              <Input
-                type="number"
-                min={0}
-                step={5}
-                value={autoRefreshMinutes}
-                onChange={(e) => setAutoRefreshMinutes(Number(e.target.value))}
-              />
-            </div>
-            <div className="space-y-2">
-              <label className="text-sm font-medium text-gray-700">Статус индекса</label>
-              <div className="text-sm text-gray-600">
-                {status.last_indexed ? `Обновлено: ${status.last_indexed}` : 'Не обновлялось'}
-                {typeof status.chunks === 'number' ? ` • Фрагменты: ${status.chunks}` : ''}
-                {status.last_error ? ` • Ошибка: ${status.last_error}` : ''}
-              </div>
-            </div>
-          </div>
-          
-          <div className="flex justify-end">
-            <Button
-              className="bg-black text-white hover:bg-gray-800"
-              onClick={handleSubmit}
-              disabled={loading}
-            >
-              Отправить
-            </Button>
-            <Button
-              className="ml-3"
-              variant="outline"
-              onClick={handleReindex}
-              disabled={loading}
-            >
-              Обновить индекс
-            </Button>
-          </div>
+  if (loading) {
+    return (
+      <div className="h-screen flex items-center justify-center bg-white">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-8 h-8 border-2 border-gray-200 border-t-blue-500 rounded-full animate-spin" />
+          <p className="text-sm text-gray-500 font-medium">Загрузка настроек...</p>
         </div>
       </div>
+    );
+  }
+
+  return (
+    <div className="h-[100dvh] bg-gray-50/50 flex flex-col overflow-hidden">
+      {/* Header */}
+      <header className="h-14 flex items-center px-4 sm:px-6 border-b border-gray-200 bg-white sticky top-0 z-20 shrink-0">
+        <div className="flex items-center justify-between w-full max-w-5xl mx-auto gap-2">
+          <div className="flex items-center gap-2 sm:gap-4 min-w-0">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={() => navigate("/")}
+              className="h-9 w-9 text-gray-500 hover:bg-gray-100 flex-shrink-0"
+            >
+              <ArrowLeft size={18} />
+            </Button>
+            <div className="flex items-center gap-2 min-w-0">
+              <Brain className="text-blue-600 flex-shrink-0" size={20} />
+              <h1 className="text-sm sm:text-base font-bold text-gray-900 truncate">Настройки ИИ</h1>
+            </div>
+          </div>
+          <Button
+            size="sm"
+            onClick={handleSubmit}
+            disabled={isSaving}
+            className="h-8 sm:h-9 px-3 sm:px-6 bg-gray-900 text-white hover:bg-gray-800 text-[10px] sm:text-xs font-bold uppercase tracking-wider"
+          >
+            {isSaving ? '...' : 'Upd Save'}
+          </Button>
+        </div>
+      </header>
+
+      <main className="flex-1 p-4 sm:p-6 overflow-y-auto scrolling-touch">
+        <div className="max-w-5xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6 pb-10">
+          
+          {/* Left Column: Main Context */}
+          <div className="lg:col-span-2 space-y-6">
+            <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+              <div className="px-5 py-4 border-b border-gray-100 bg-gray-50/50 flex items-center gap-2">
+                <Sparkles size={16} className="text-blue-500" />
+                <h2 className="text-xs font-black text-gray-900 uppercase tracking-widest">Основной контекст</h2>
+              </div>
+              <div className="p-5">
+                <Textarea
+                  placeholder="Опишите роль ИИ, его задачи и общую информацию о компании..."
+                  className="min-h-[350px] p-4 text-sm leading-relaxed border-gray-100 focus:border-blue-500 focus:ring-0 bg-gray-50/30 rounded-xl resize-none"
+                  value={systemMessage}
+                  onChange={(e) => setSystemMessage(e.target.value)}
+                />
+              </div>
+            </section>
+          </div>
+
+          {/* Right Column: Data Sources */}
+          <div className="space-y-6">
+            <section className="bg-white rounded-2xl border border-gray-200 shadow-sm overflow-hidden">
+              <div className="px-5 py-4 border-b border-gray-100 bg-gray-50/50 flex items-center gap-2">
+                <Database size={16} className="text-rose-500" />
+                <h2 className="text-xs font-black text-gray-900 uppercase tracking-widest">Источники данных</h2>
+              </div>
+              <div className="p-5 space-y-5">
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">Фразы для перевода на человека</label>
+                  <Textarea
+                    placeholder="менеджер&#10;позови человека"
+                    className="min-h-[100px] p-3 text-xs bg-gray-50 border-gray-100 focus:border-rose-500 focus:ring-0 rounded-lg resize-none"
+                    value={handoffPhrases}
+                    onChange={(e) => setHandoffPhrases(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-[10px] font-bold text-gray-400 uppercase tracking-wider">URL для парсинга</label>
+                  <Textarea
+                    placeholder="https://site.ru/about"
+                    className="min-h-[100px] p-3 text-xs bg-gray-50 border-gray-100 focus:border-rose-500 focus:ring-0 rounded-lg resize-none"
+                    value={sitePages}
+                    onChange={(e) => setSitePages(e.target.value)}
+                  />
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
     </div>
   );
 };
 
-export default MessageBox; 
+export default MessageBox;
