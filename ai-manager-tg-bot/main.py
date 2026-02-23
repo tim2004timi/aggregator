@@ -59,6 +59,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
 
+# XAI (Grok) configuration
+XAI_API_KEY = os.getenv("XAI_API_KEY")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-latest")
+XAI_BASE_URL = "https://api.x.ai/v1/chat/completions"
+
+# Chats using /test mode (xai model)
+_xai_test_chats: set = set()
+
 AI_TOP_K = int(os.getenv("AI_TOP_K", "6"))
 AI_MAX_PRODUCTS = int(os.getenv("AI_MAX_PRODUCTS", "300"))
 AI_PRODUCTS_PAGE = int(os.getenv("AI_PRODUCTS_PAGE", "50"))
@@ -1811,38 +1819,48 @@ async def _ai_auto_refresh_loop() -> None:
         except Exception:
             await asyncio.sleep(60)
 
-async def _ai_openrouter(messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not OPENAI_API_KEY:
-        logging.error("❌ OpenAI API key not found")
+async def _ai_openrouter(messages: List[Dict[str, Any]], use_xai: bool = False) -> Optional[Dict[str, Any]]:
+    if use_xai and XAI_API_KEY:
+        api_key = XAI_API_KEY
+        model = XAI_MODEL
+        base_url = XAI_BASE_URL
+        label = "XAI"
+    else:
+        api_key = OPENAI_API_KEY
+        model = OPENAI_MODEL
+        base_url = "https://api.openai.com/v1/chat/completions"
+        label = "OpenAI"
+    if not api_key:
+        logging.error(f"❌ {label} API key not found")
         return None
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     payload = {
-        "model": OPENAI_MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 0.2,
         "max_tokens": 600,
     }
     current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
     try:
-        logging.info(f"🤖 Sending request to OpenAI API with model: {OPENAI_MODEL}")
+        logging.info(f"🤖 Sending request to {label} API with model: {model}")
         async with current_session.post(
-            "https://api.openai.com/v1/chat/completions",
+            base_url,
             headers=headers,
             json=payload,
             timeout=aiohttp.ClientTimeout(total=OPENAI_TIMEOUT),
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
-                logging.error(f"❌ OpenAI API error {resp.status}: {error_text}")
+                logging.error(f"❌ {label} API error {resp.status}: {error_text}")
                 return None
             data = await resp.json()
-            logging.info("✅ OpenAI API response received")
+            logging.info(f"✅ {label} API response received")
             return data
     except Exception as e:
-        logging.error(f"❌ OpenAI API exception: {e}")
+        logging.error(f"❌ {label} API exception: {e}")
         return None
     finally:
         if current_session != http_session:
@@ -1903,7 +1921,7 @@ async def _ai_build_sizes_context(product_id: str, fallback_id: Optional[str] = 
     logging.info(f"🔍 Sizes context: {result}")
     return result
 
-async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Optional[str] = None, product_id: Optional[str] = None, product_base_id: Optional[str] = None, product_categories: Optional[List[str]] = None, conversation_history: Optional[str] = None, previous_user_message: Optional[str] = None, is_product_question: bool = False) -> Dict[str, Any]:
+async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Optional[str] = None, product_id: Optional[str] = None, product_base_id: Optional[str] = None, product_categories: Optional[List[str]] = None, conversation_history: Optional[str] = None, previous_user_message: Optional[str] = None, is_product_question: bool = False, use_xai: bool = False) -> Dict[str, Any]:
     settings = await _ai_get_settings(db)
     text_norm = _normalize(question)
 
@@ -1998,7 +2016,7 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
             "content": f"Контекст:\n{context_text}\n\nВопрос клиента: {question}"
         }
     ]
-    data = await _ai_openrouter(messages)
+    data = await _ai_openrouter(messages, use_xai=use_xai)
     if not data:
         return {"handoff": True, "answer": "", "confidence": top_score, "reason": "llm_error"}
 
@@ -4131,6 +4149,19 @@ async def cmd_menu(message: Message):
 async def cmd_faq(message: Message):
     await message.answer(_tg_faq_text(1), reply_markup=tg_kb_faq_menu(1), parse_mode="HTML")
 
+@dp.message(Command("test"))
+async def cmd_test(message: Message):
+    chat_id = str(message.chat.id)
+    if chat_id in _xai_test_chats:
+        _xai_test_chats.discard(chat_id)
+        await message.answer(f"🔄 Модель переключена обратно на OpenAI ({OPENAI_MODEL})")
+    else:
+        if not XAI_API_KEY:
+            await message.answer("❌ XAI_API_KEY не настроен")
+            return
+        _xai_test_chats.add(chat_id)
+        await message.answer(f"🧪 Тестовый режим: модель переключена на XAI ({XAI_MODEL})")
+
 @dp.callback_query(F.data.startswith("m:"))
 async def handle_menu_callback(callback: types.CallbackQuery):
     parts = (callback.data or "").split(":")
@@ -4646,6 +4677,7 @@ async def handle_message(message: Message):
                 conversation_history=history_text,
                 previous_user_message=_ai_get_previous_user_message(history, message.text),
                 is_product_question=is_product_q,
+                use_xai=str(message.chat.id) in _xai_test_chats,
             )
             
             # Если AI решил передать менеджеру - сразу передаём
