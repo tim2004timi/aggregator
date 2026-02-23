@@ -1988,7 +1988,7 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
             context_text = "\n\n".join([p for p in context_parts if p])
     if not context_text:
         context_text = "В базе знаний нет релевантной информации по этому запросу. Отвечай СТРОГО по системному промту. Не выдумывай факты."
-
+ 
     if conversation_history:
         context_text = f"История диалога:\n{conversation_history}\n\n{context_text}"
 
