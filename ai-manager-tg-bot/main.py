@@ -4151,16 +4151,33 @@ async def cmd_faq(message: Message):
 
 @dp.message(Command("test"))
 async def cmd_test(message: Message):
-    chat_id = str(message.chat.id)
-    if chat_id in _xai_test_chats:
-        _xai_test_chats.discard(chat_id)
-        await message.answer(f"🔄 Модель переключена обратно на OpenAI ({OPENAI_MODEL})")
-    else:
-        if not XAI_API_KEY:
-            await message.answer("❌ XAI_API_KEY не настроен")
+    if not XAI_API_KEY:
+        await message.answer("❌ XAI_API_KEY не настроен")
+        return
+    question = (message.text or "").split(maxsplit=1)[1] if len((message.text or "").split(maxsplit=1)) > 1 else ""
+    if not question.strip():
+        await message.answer("Использование: /test <вопрос>\nОтправит вопрос через XAI Grok")
+        return
+    async with async_session() as session:
+        chat = await get_chat_by_uuid(session, str(message.chat.id))
+        if not chat:
+            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+        history = await get_chat_messages(session, chat.id, limit=6)
+        history_text = _ai_build_history(history, max_items=6)
+        ai_result = await _ai_answer_question(
+            session,
+            question,
+            conversation_history=history_text,
+            previous_user_message=_ai_get_previous_user_message(history, question),
+            use_xai=True,
+        )
+        answer = str(ai_result.get("answer") or "").strip()
+        answer = _normalize_price_text(answer)
+        answer = _ai_cleanup_answer(answer)
+        if not answer:
+            await message.answer("XAI не смог ответить на вопрос")
             return
-        _xai_test_chats.add(chat_id)
-        await message.answer(f"🧪 Тестовый режим: модель переключена на XAI ({XAI_MODEL})")
+        await message.answer(f"🧪 [{XAI_MODEL}]\n{answer}")
 
 @dp.callback_query(F.data.startswith("m:"))
 async def handle_menu_callback(callback: types.CallbackQuery):
