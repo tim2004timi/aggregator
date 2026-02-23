@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getChatStats } from '@/lib/api';
-import { MessageSquare, CircleDot, Settings, Bot, BarChart3 } from 'lucide-react';
+import { MessageSquare, CircleDot, Bot, BarChart3 } from 'lucide-react';
 import { useWebSocket } from '@/contexts/WebSocketContext';
 import { Button } from '@/components/ui/button';
 import { useLocation, useNavigate } from 'react-router-dom';
@@ -98,15 +98,7 @@ const ChatStats = () => {
             >
               <BarChart3 size={18} className="sm:size-20" />
             </Button>
-            <Button
-              variant="outline"
-              size="icon"
-              onClick={() => navigate('/message-box')}
-              className={`w-8 h-8 sm:w-10 sm:h-10 border-gray-300 hover:bg-gray-100 ${location.pathname === '/message-box' ? 'bg-gray-100' : ''}`}
-              title="Настройки"
-            >
-              <Settings size={18} className="sm:size-20" />
-            </Button>
+
           </div>
         </div>
       )}

@@ -1,5 +1,4 @@
 import asyncio
-import difflib
 import logging
 from aiogram import Dispatcher, types
 from aiogram.filters import Command
@@ -80,6 +79,122 @@ DEFAULT_AI_SETTINGS = {
 AI_SETTINGS_CACHE: Dict[str, Any] = {"data": None, "ts": 0.0}
 AI_KNOWLEDGE_CACHE: Dict[str, Any] = {"data": [], "tokens": [], "ts": 0.0}
 AI_STATUS: Dict[str, Any] = {"last_indexed": None, "last_error": None, "chunks": 0}
+
+# Промт для обычного чата поддержки (когда пользователь просто пишет боту)
+AI_SUPPORT_PROMPT = (
+    "AI Support Assistant — PSIH (psihclothes.com)\n\n"
+    "Ассистент работает как цифровая справка магазина PSIH.\n"
+    "Он отвечает на вопросы клиентов, используя только фактическую информацию о бренде, товарах, доставке, оплате, возврате и уходе за изделиями.\n\n"
+    "Стиль ответа — спокойный, человеческий, без канцелярита и без заученных фраз.\n"
+    "Каждый ответ формулируется по смыслу вопроса, без одинаковых конструкций.\n"
+    "Ассистент не ведёт диалог ради диалога — он даёт информацию, которую запросили.\n\n"
+    "Если информации достаточно — отвечает сразу и по делу.\n"
+    "Если информации нет или она неизвестна — прямо сообщает об этом и уточняет, хочет ли клиент, чтобы подключился менеджер.\n\n"
+    "Ассистент не делает предположений и не дополняет ответы догадками.\n"
+    "Основа ответа — только реальные данные магазина.\n\n"
+    "Язык ответа всегда совпадает с языком сообщения клиента.\n\n"
+    "---\n\n"
+    "О БРЕНДЕ\n\n"
+    "PSIH — бренд одежды, существующий с 1 августа 2018 года.\n"
+    "Это одежда и аксессуары российского производства.\n\n"
+    "Философия бренда:\n"
+    "ПСИХ — это визуализация самых далёких уголков разума, эстетика человеческих переживаний, выраженная в дизайне вещей.\n\n"
+    "Сайт: https://psihclothes.com\n\n"
+    "Связь:\n"
+    "VK — vk.com/psihclothes\n"
+    "Telegram — t.me/psihclothes\n"
+    "Сотрудничество — cooperation@psihclothes.com\n\n"
+    "Продавец:\n"
+    "ИП Дарков Владислав Игоревич\n"
+    "ОГРНИП 320435000030462\n\n"
+    "---\n\n"
+    "ТОВАРЫ\n\n"
+    "Товары — одежда и аксессуары, представленные на сайте.\n"
+    "Описание, фото и цена указаны на странице товара.\n"
+    "Фотографии являются иллюстрациями и могут немного отличаться от фактического вида.\n\n"
+    "---\n\n"
+    "ЗАКАЗ\n\n"
+    "Заказ оформляется покупателем самостоятельно через сайт.\n"
+    "После оформления необходимо оплатить заказ в течение 30 минут, иначе он отменяется автоматически.\n\n"
+    "Изготовление заказа занимает от 14 до 45 календарных дней с момента оплаты.\n"
+    "В отдельных случаях срок может быть увеличен — об этом покупателя уведомляют.\n\n"
+    "---\n\n"
+    "ПРЕДЗАКАЗ\n\n"
+    "Метка «Предзаказ» означает, что товара нет в наличии и он изготавливается под клиента.\n"
+    "Отправка такого товара осуществляется не ранее чем через 21 день после оплаты.\n"
+    "Сроки могут уточняться дополнительно через уведомления.\n\n"
+    "---\n\n"
+    "ОПЛАТА\n\n"
+    "Оплата производится банковской картой на сайте.\n"
+    "Продажа осуществляется по 100% предоплате.\n\n"
+    "Цена фиксируется в момент оформления заказа и не изменяется.\n\n"
+    "---\n\n"
+    "ДОСТАВКА\n\n"
+    "Доставка выполняется через:\n"
+    "Почту России\n"
+    "СДЭК\n\n"
+    "Минимальный срок доставки — от 7 дней после оплаты.\n"
+    "Срок зависит от региона и рассчитывается индивидуально.\n"
+    "Стоимость доставки оплачивается покупателем.\n\n"
+    "Доставка возможна по России, странам СНГ и по миру.\n"
+    "Международная доставка — стоимость товара + 1000 рублей.\n\n"
+    "Срок хранения заказа в пункте выдачи — 7 дней.\n\n"
+    "---\n\n"
+    "ВОЗВРАТ\n\n"
+    "Если обнаружен производственный брак — товар можно вернуть.\n"
+    "Если не подошёл размер, фасон или внешний вид — возврат возможен при сохранении товарного состояния.\n\n"
+    "Условия возврата:\n"
+    "— без следов носки\n"
+    "— сохранена упаковка\n"
+    "— сохранена бирка\n"
+    "— товарный вид не нарушен\n\n"
+    "Срок обращения:\n"
+    "— при браке — в течение 3 дней после получения\n"
+    "— если не подошёл — в течение 7 дней после получения\n\n"
+    "Доставка при возврате оплачивается покупателем.\n"
+    "Стоимость первоначальной доставки не возвращается.\n\n"
+    "Возврат денежных средств производится после получения товара магазином:\n"
+    "обычно до 10 дней, в отдельных случаях — до 30 рабочих дней (зависит от банка).\n\n"
+    "---\n\n"
+    "УХОД ЗА ОДЕЖДОЙ\n\n"
+    "Рекомендуется:\n"
+    "— ручная или деликатная стирка при 15–30°C\n"
+    "— стирать изделие вывернутым наизнанку\n"
+    "— использовать умеренное количество моющих средств\n"
+    "— не использовать отбеливатели\n"
+    "— не замачивать\n"
+    "— не тереть места с нанесённым рисунком\n"
+    "— не выжимать скручиванием\n"
+    "— стирать отдельно от других вещей\n\n"
+    "Сушить горизонтально, без прямого солнца.\n"
+    "Гладить с изнаночной стороны, при необходимости — через ткань.\n\n"
+    "---\n\n"
+    "Если ассистент не располагает нужной информацией, он сообщает об этом и предлагает подключить менеджера для уточнения.\n"
+)
+
+# Промт для "Спросить у ИИ" (когда пользователь нажимает кнопку в товаре)
+AI_PRODUCT_PROMPT = (
+    "AI Product Assistant — PSIH\n\n"
+    "Ассистент отвечает на вопросы о конкретном товаре, используя данные, полученные из бэкенда.\n"
+    "Контекст содержит фактическую информацию о товаре: название, описание, цену, доступные цвета, размеры, состав, особенности, рекомендации по уходу и другие характеристики.\n\n"
+    "Ответ формируется на основе этих данных.\n"
+    "Никакая информация не добавляется от себя.\n\n"
+    "Ассистент объясняет характеристики товара, помогает понять различия, свойства, детали изделия и условия использования.\n"
+    "Ответ даётся по сути вопроса, без рекламных формулировок и без попытки «продать».\n\n"
+    "Фразы не повторяются шаблонно — формулировка каждый раз естественная, но смысл остаётся точным.\n"
+    "Ответ не выходит за пределы переданного контекста.\n\n"
+    "Если нужной информации в данных нет, ассистент прямо сообщает, что в доступной информации этого нет, и уточняет, хочет ли клиент, чтобы подключился менеджер для уточнения.\n\n"
+    "Язык ответа всегда совпадает с языком вопроса клиента.\n\n"
+    "Ассистент может:\n"
+    "— пояснять описание товара простыми словами\n"
+    "— называть цену и характеристики\n"
+    "— перечислять доступные варианты (цвет, размер и т.д.), если они есть в данных\n"
+    "— объяснять рекомендации по уходу\n"
+    "— уточнять различия между вариантами товара\n"
+    "— отвечать только на то, о чём спросили\n\n"
+    "Ассистент не делает предположений о наличии, сроках доставки, изменениях заказа или любых данных, которых нет в контексте.\n"
+    "Он работает как интерпретатор карточки товара, а не как менеджер магазина.\n"
+)
 
 FAQ_INLINE_RAW = ""
 
@@ -1415,56 +1530,6 @@ def _ai_cleanup_answer(text: str) -> str:
     return cleaned.strip()
 
 
-def _ai_is_order_question(text_norm: str) -> bool:
-    keywords = [
-        "заказ", "трек", "трекномер", "номер заказа", "статус заказа",
-        "отслед", "отслеж", "tracking", "track", "parcel", "shipment",
-    ]
-    if any(k in text_norm for k in keywords):
-        return True
-    # Дополнительные шаблоны для вопросов о статусе/треке
-    patterns = [
-        r"\bгде\s+посыл",          # где посылка/посылку
-        r"\bкак\s+отслед",         # как отследить
-        r"\bстатус\s+заказ",       # статус заказа
-        r"\bномер\s+заказ",        # номер заказа
-    ]
-    return any(re.search(p, text_norm) for p in patterns)
-
-
-def _ai_is_greeting(text_norm: str) -> bool:
-    greetings = [
-        "привет", "здравствуйте", "добрый", "салют", "хай", "hello", "hi", "hey",
-        "good morning", "good afternoon", "good evening",
-    ]
-    tokens = _ai_tokenize(text_norm)
-    if not tokens:
-        return False
-    if any(g in text_norm for g in greetings):
-        # Если есть вопрос/смысловая часть — пусть отвечает модель
-        if "?" in text_norm:
-            return False
-        if len(tokens) > 3:
-            return False
-        return True
-    return False
-
-def _ai_is_greeting_fuzzy(text_norm: str) -> bool:
-    tokens = _ai_tokenize(text_norm)
-    if not tokens:
-        return False
-    candidates = [
-        "привет", "здравствуйте", "здорово", "добрый", "доброе", "добрыйвечер", "доброеутро",
-        "hi", "hello", "hey", "goodmorning", "goodafternoon", "goodevening",
-    ]
-    for t in tokens[:3]:
-        if len(t) > 12:
-            continue
-        for c in candidates:
-            if difflib.SequenceMatcher(a=t, b=c).ratio() >= 0.8:
-                return True
-    return False
-
 def _ai_is_recommendation(text_norm: str) -> bool:
     keys = ["посовет", "рекоменд", "какой товар", "что купить", "что посовету"]
     return any(k in text_norm for k in keys)
@@ -1479,9 +1544,6 @@ def _ai_has_product_intent(text_norm: str) -> bool:
     if _ai_is_recommendation(text_norm):
         return True
     return any(k in text_norm for k in keywords)
-
-def _ai_is_latin(text: str) -> bool:
-    return bool(re.search(r"[a-z]", text.lower()))
 
 def _ai_build_history(messages: List[Dict[str, Any]], max_items: int = 6) -> str:
     if not messages:
@@ -1511,54 +1573,10 @@ def _ai_get_previous_user_message(messages: List[Dict[str, Any]], current_text: 
         return content
     return None
 
-def _ai_is_history_question(text_norm: str) -> bool:
-    keys = [
-        "что я писал", "что я написал", "что писал", "что писал до",
-        "что я писал до", "что я писал ранее", "что я писал перед",
-        "что писал ранее", "что писал перед", "что писал до этого",
-    ]
-    return any(k in text_norm for k in keys)
 
-def _ai_greeting_reply(raw_text: str) -> str:
-    if _ai_is_latin(raw_text):
-        return "Hello! How can I help you?"
-    return "Привет! Чем могу помочь?"
 
-async def _ai_generate_text(prompt: str) -> str:
-    """Генерирует короткий ответ через LLM без шаблонов"""
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Ты отвечаешь коротко, вежливо и по делу. "
-                "Не используй шаблонные фразы. "
-                "Верни только текст ответа без markdown."
-            ),
-        },
-        {"role": "user", "content": prompt},
-    ]
-    data = await _ai_openrouter(messages)
-    if not data:
-        return ""
-    try:
-        return str(data["choices"][0]["message"]["content"]).strip()
-    except Exception:
-        return ""
 
-async def _ai_handoff_reply() -> str:
-    """Сообщение о передаче менеджеру без шаблона"""
-    return await _ai_generate_text(
-        "Клиент подтвердил связь с менеджером. Сообщи, что запрос передан менеджеру и он свяжется. Один короткий ответ."
-    )
-
-async def _ai_handoff_question(question: str) -> str:
-    """Вопрос о передаче менеджеру без шаблона"""
-    return await _ai_generate_text(
-        f"Клиент спросил: «{question}». "
-        "Коротко и вежливо скажи что сейчас подключишь менеджера для помощи. "
-        "НЕ предлагай 'связаться' — скажи что менеджер скоро ответит. "
-        "Ответ должен быть 1-2 предложения, без списков и без предложений помочь с товарами."
-    )
+HANDOFF_MESSAGE = "Запрос передан менеджеру, он свяжется с вами."
 
 def _ai_is_handoff_confirm(text_norm: str) -> bool:
     """Определяет согласие пользователя на связь с менеджером"""
@@ -1578,8 +1596,7 @@ def _ai_is_handoff_confirm(text_norm: str) -> bool:
             return True
     return False
 
-def _ai_recommendation_reply() -> str:
-    return "Напишите, что ищете — постараюсь помочь с выбором."
+
 
 
 async def _ai_get_settings(db: AsyncSession) -> Dict[str, Any]:
@@ -1967,28 +1984,9 @@ async def _ai_answer_question(db: AsyncSession, question: str, extra_context: Op
     )
 
     if is_product_question:
-        # "Спросить у ИИ" — отвечаем по контексту товара, без промта поддержки
-        system_content = (
-            "Ты — консультант по товарам. Отвечай на вопросы клиента о товаре "
-            "на основе предоставленного контекста. Будь кратким и полезным."
-            + json_format
-        )
+        system_content = AI_PRODUCT_PROMPT + json_format
     else:
-        # Поддержка — промт берётся с сайта /message-box
-        system_message = settings.get("system_message") or ""
-        rules = settings.get("rules") or ""
-        tone = settings.get("tone") or ""
-
-        system_parts = []
-        if system_message:
-            system_parts.append(system_message)
-        if tone:
-            system_parts.append(f"Тон общения: {tone}")
-        if rules:
-            system_parts.append(f"Дополнительные правила: {rules}")
-
-        base_prompt = ("\n\n".join(system_parts) + "\n\n") if system_parts else ""
-        system_content = base_prompt + json_format
+        system_content = AI_SUPPORT_PROMPT + json_format
 
     messages = [
         {
@@ -2596,9 +2594,7 @@ async def handle_single_event(event):
                 return
             if cmd == "manager":
                 await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-                text_out = await _ai_handoff_reply()
-                if text_out:
-                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+                await vk_send_message(peer_id, HANDOFF_MESSAGE, keyboard=vk_kb_main())
                 return
 
         text_norm = _normalize(text)
@@ -2633,9 +2629,7 @@ async def handle_single_event(event):
             return
         if not suppress_ai and ("позови менеджера" in text_norm or text_norm == "менеджер"):
             await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-            text_out = await _ai_handoff_reply()
-            if text_out:
-                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+            await vk_send_message(peer_id, HANDOFF_MESSAGE, keyboard=vk_kb_main())
             return
 
         # --- 2) Текстовое сообщение ---
@@ -2670,24 +2664,9 @@ async def handle_single_event(event):
         state = _get_state("vk", str(peer_id))
         text_norm = _normalize(text)
 
-        # Если ждём подтверждения на связь с менеджером
-        if state.get("handoff_pending"):
-            if _ai_is_handoff_confirm(text_norm):
-                await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-                text_out = await _ai_handoff_reply()
-                if text_out:
-                    await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
-                state.pop("handoff_pending", None)
-                return
-            if text_norm in {"нет", "не", "не надо", "не нужно"}:
-                state.pop("handoff_pending", None)
-            # иначе продолжаем как с новым вопросом
-
         if _ai_is_handoff_confirm(text_norm):
             await request_manager(session, chat.id, str(peer_id), user_name, "vk")
-            text_out = await _ai_handoff_reply()
-            if text_out:
-                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+            await vk_send_message(peer_id, HANDOFF_MESSAGE, keyboard=vk_kb_main())
             return
 
         if suppress_ai:
@@ -2771,12 +2750,10 @@ async def handle_single_event(event):
             is_product_question=is_product_q,
         )
         
-        # Если AI решил передать менеджеру - сначала спрашиваем пользователя
+        # Если AI решил передать менеджеру - сразу передаём
         if ai_result.get("handoff"):
-            state["handoff_pending"] = True
-            text_out = await _ai_handoff_question(text)
-            if text_out:
-                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+            await vk_send_message(peer_id, HANDOFF_MESSAGE, keyboard=vk_kb_main())
             return
 
         # Если ответ пустой - тоже передаем менеджеру
@@ -2784,10 +2761,8 @@ async def handle_single_event(event):
         answer = _normalize_price_text(answer)
         answer = _ai_cleanup_answer(answer)
         if not answer:
-            state["handoff_pending"] = True
-            text_out = await _ai_handoff_question(text)
-            if text_out:
-                await vk_send_message(peer_id, text_out, keyboard=vk_kb_main())
+            await request_manager(session, chat.id, str(peer_id), user_name, "vk")
+            await vk_send_message(peer_id, HANDOFF_MESSAGE, keyboard=vk_kb_main())
             return
 
         await asyncio.to_thread(
@@ -3497,24 +3472,6 @@ async def remove_chat_tag_endpoint(chat_id: int, tag: str, db: AsyncSession = De
         await updates_manager.broadcast(json.dumps(update_message))
     return result
 
-@app.delete("/api/messages/{message_id}")
-async def delete_message_endpoint(message_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    result = await db.execute(select(Message).where(Message.id == message_id))
-    msg = result.scalar_one_or_none()
-    if not msg:
-        raise HTTPException(status_code=404, detail="Message not found")
-    chat_id = msg.chat_id
-    await db.delete(msg)
-    await db.commit()
-    # Уведомляем фронтенды об удалении сообщения
-    update_message = {
-        "type": "message_deleted",
-        "chatId": str(chat_id),
-        "messageId": message_id
-    }
-    await updates_manager.broadcast(json.dumps(update_message))
-    return {"success": True}
-
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
     chat = await get_chat(db, chat_id)
@@ -3919,61 +3876,6 @@ async def upload_image(
             logging.error("Failed to forward web-dashboard photo to forum: %s", e)
 
     return {"message": db_img, "delivered": delivered, "delivery_error": delivery_error}
-
-@app.get("/api/ai/context")
-async def get_ai_context(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    settings = await _ai_get_settings(db)
-    return {
-        "system_message": settings.get("system_message", ""),
-        "faqs": settings.get("faqs", ""),
-    }
-
-class PutAIContext(BaseModel):
-    system_message: str = ""
-    faqs: str = ""
-
-@app.put("/api/ai/context")
-async def put_ai_context(new_ai_context: PutAIContext, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    payload = {
-        "system_message": new_ai_context.system_message or "",
-        "faqs": new_ai_context.faqs or "",
-    }
-    await upsert_ai_settings(db, payload)
-    AI_SETTINGS_CACHE["data"] = None
-    return payload
-
-class PutAISettings(BaseModel):
-    system_message: Optional[str] = None
-    faqs: Optional[str] = None
-    rules: Optional[str] = None
-    tone: Optional[str] = None
-    handoff_phrases: Optional[str] = None
-    min_score: Optional[float] = None
-    site_pages: Optional[str] = None
-    auto_refresh_minutes: Optional[int] = None
-
-@app.get("/api/ai/settings")
-async def get_ai_settings_endpoint(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    return await _ai_get_settings(db)
-
-@app.put("/api/ai/settings")
-async def put_ai_settings_endpoint(payload: PutAISettings, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    data = {k: v for k, v in payload.dict().items() if v is not None}
-    if not data:
-        return await _ai_get_settings(db)
-    await upsert_ai_settings(db, data)
-    AI_SETTINGS_CACHE["data"] = None
-    return await _ai_get_settings(db)
-
-@app.get("/api/ai/status")
-async def get_ai_status(_: bool = Depends(auth.require_auth)):
-    return AI_STATUS
-
-@app.post("/api/ai/reindex")
-async def reindex_ai(db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
-    return await _ai_reindex(db)
-
-
 
 def _is_forum_group(message: types.Message) -> bool:
     """Проверяет, что сообщение пришло из нашей форум-группы"""
@@ -4507,9 +4409,7 @@ async def handle_menu_callback(callback: types.CallbackQuery):
                     }
                 }))
             await request_manager(session, chat.id, str(callback.message.chat.id), callback.from_user.first_name or str(callback.message.chat.id), "telegram")
-        text_out = await _ai_handoff_reply()
-        if text_out:
-            await callback.message.answer(text_out, reply_markup=tg_kb_main())
+        await callback.message.answer(HANDOFF_MESSAGE, reply_markup=tg_kb_main())
         return
 
 @dp.callback_query(lambda c: c.data.startswith("notifications_"))
@@ -4615,24 +4515,9 @@ async def handle_message(message: Message):
             await message.answer("<b>Каталог</b>\n<blockquote>Выберите категорию</blockquote>", parse_mode="HTML", reply_markup=_tg_kb(rows))
             return
 
-        # Если ждём подтверждения на связь с менеджером
-        if state.get("handoff_pending"):
-            if _ai_is_handoff_confirm(text_norm):
-                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
-                text_out = await _ai_handoff_reply()
-                if text_out:
-                    await message.answer(text_out, reply_markup=tg_kb_main())
-                state.pop("handoff_pending", None)
-                return
-            if text_norm in {"нет", "не", "не надо", "не нужно"}:
-                state.pop("handoff_pending", None)
-            # иначе продолжаем как с новым вопросом
-
         if _ai_is_handoff_confirm(text_norm):
             await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
-            text_out = await _ai_handoff_reply()
-            if text_out:
-                await message.answer(text_out, reply_markup=tg_kb_main())
+            await message.answer(HANDOFF_MESSAGE, reply_markup=tg_kb_main())
             return
 
         force_manager = not suppress_ai and ("позови менеджера" in text_norm or text_norm == "менеджер")
@@ -4735,9 +4620,7 @@ async def handle_message(message: Message):
                     chat_name=message.chat.first_name or str(message.chat.id),
                     messager="telegram"
                 )
-            text_out = await _ai_handoff_reply()
-            if text_out:
-                await message.answer(text_out, reply_markup=tg_kb_main())
+            await message.answer(HANDOFF_MESSAGE, reply_markup=tg_kb_main())
             return
 
         if suppress_ai:
@@ -4765,13 +4648,10 @@ async def handle_message(message: Message):
                 is_product_question=is_product_q,
             )
             
-            # Если AI решил передать менеджеру - сначала спрашиваем пользователя
+            # Если AI решил передать менеджеру - сразу передаём
             if ai_result.get("handoff"):
-                state = _get_state("tg", str(message.chat.id))
-                state["handoff_pending"] = True
-                text_out = await _ai_handoff_question(message.text)
-                if text_out:
-                    await message.answer(text_out, reply_markup=tg_kb_main())
+                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+                await message.answer(HANDOFF_MESSAGE, reply_markup=tg_kb_main())
                 return
 
             # Если ответ пустой - тоже передаем менеджеру
@@ -4779,11 +4659,8 @@ async def handle_message(message: Message):
             answer = _normalize_price_text(answer)
             answer = _ai_cleanup_answer(answer)
             if not answer:
-                state = _get_state("tg", str(message.chat.id))
-                state["handoff_pending"] = True
-                text_out = await _ai_handoff_question(message.text)
-                if text_out:
-                    await message.answer(text_out, reply_markup=tg_kb_main())
+                await request_manager(session, chat.id, str(message.chat.id), message.chat.first_name or str(message.chat.id), "telegram")
+                await message.answer(HANDOFF_MESSAGE, reply_markup=tg_kb_main())
                 return
 
             await message.answer(answer)

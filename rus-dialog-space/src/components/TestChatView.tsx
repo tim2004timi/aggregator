@@ -3,7 +3,7 @@ import { Message, Chat, getChatMessages, toggleAiChat, deleteChat, API_URL, fetc
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical, X } from 'lucide-react';
+import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical } from 'lucide-react';
 import { toast } from '@/components/ui/sonner';
 import {
   AlertDialog,
@@ -70,7 +70,6 @@ const TestChatView = ({ chatId, onChatDeleted }: TestChatViewProps) => {
     shouldAutoScroll,
     setShouldAutoScroll,
     selectChat: selectChatFromContext,
-    deleteMessage: deleteMessageFromContext
   } = useChat();
 
   const lastSeenMessageRef = useRef<string>('');
@@ -479,14 +478,6 @@ const TestChatView = ({ chatId, onChatDeleted }: TestChatViewProps) => {
                   key={`${message.id}-${index}`}
                   message={message} 
                   formatTime={formatMessageTime}
-                  onDelete={async (messageId) => {
-                    try {
-                      await deleteMessageFromContext(messageId);
-                      toast.success('Сообщение удалено');
-                    } catch {
-                      toast.error('Не удалось удалить сообщение');
-                    }
-                  }}
                 />
               ))}
             <div ref={messagesEndRef} className="h-1" />
@@ -712,10 +703,9 @@ const TestChatView = ({ chatId, onChatDeleted }: TestChatViewProps) => {
 interface MessageBubbleProps {
   message: Message;
   formatTime: (timestamp: string) => string;
-  onDelete: (messageId: number) => void;
 }
 
-const MessageBubble = ({ message, formatTime, onDelete }: MessageBubbleProps) => {
+const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
   const isQuestion = message.message_type === 'question';
   const imageRef = useRef<HTMLImageElement>(null);
   const [open, setOpen] = useState(false);
@@ -723,7 +713,6 @@ const MessageBubble = ({ message, formatTime, onDelete }: MessageBubbleProps) =>
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [start, setStart] = useState<{ x: number; y: number } | null>(null);
-  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   const handleWheel = (e: React.WheelEvent<HTMLImageElement>) => {
     e.preventDefault();
@@ -748,12 +737,6 @@ const MessageBubble = ({ message, formatTime, onDelete }: MessageBubbleProps) =>
       <div className={`max-w-[80%] rounded-lg px-4 py-2 relative ${
         isQuestion ? 'bg-gray-200 text-gray-800' : 'bg-[#1F1F1F] text-white'
       }`}>
-        <button
-          onClick={() => setShowDeleteConfirm(true)}
-          className={`absolute -top-2 ${isQuestion ? '-right-2' : '-left-2'} w-5 h-5 rounded-full bg-red-500 text-white flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity hover:bg-red-600 shadow-md z-10`}
-        >
-          <X size={12} />
-        </button>
         <div className="mb-1 flex items-center">
           {message.ai && (
             <div className="mr-1 text-xs px-1 py-0.5 bg-white/20 rounded">ИИ</div>
@@ -812,18 +795,6 @@ const MessageBubble = ({ message, formatTime, onDelete }: MessageBubbleProps) =>
         </div>
       </div>
 
-      <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
-        <AlertDialogContent className="w-[calc(100%-32px)] sm:max-w-[425px] rounded-2xl">
-          <AlertDialogHeader>
-            <AlertDialogTitle>Удалить сообщение?</AlertDialogTitle>
-            <AlertDialogDescription>Это действие нельзя отменить.</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter className="flex-col sm:flex-row gap-2">
-            <AlertDialogCancel className="mt-0">Отмена</AlertDialogCancel>
-            <AlertDialogAction onClick={() => onDelete(message.id)} className="bg-red-500 hover:bg-red-600">Удалить</AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   );
 };

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
-import { Chat, Message, getChats, getChatMessages, sendMessage as apiSendMessage, markChatAsRead as apiMarkChatAsRead, getChatStats, deleteMessage as apiDeleteMessage } from '@/lib/api';
+import { Chat, Message, getChats, getChatMessages, sendMessage as apiSendMessage, markChatAsRead as apiMarkChatAsRead, getChatStats } from '@/lib/api';
 import { useWebSocket } from './WebSocketContext';
 import type { WebSocketMessage } from '@/types';
 
@@ -15,7 +15,7 @@ interface ChatContextType {
   sendMessage: (message: string) => Promise<void>;
   refreshChats: () => Promise<void>;
   markChatAsRead: (chatId: number) => Promise<void>;
-  deleteMessage: (messageId: number) => Promise<void>;
+
 }
 
 const ChatContext = createContext<ChatContextType | null>(null);
@@ -184,8 +184,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             : chat
         ));
         fetchStats();
-      } else if (data.type === 'message_deleted' && data.messageId) {
-        setMessages(prevMessages => prevMessages.filter(msg => msg.id !== data.messageId));
       } else if (data.type === 'chat_tags_updated' && data.chatId && data.tags) {
         setChats(prevChats => {
           const updatedChats = prevChats.map(chat =>
@@ -298,11 +296,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
-  const deleteMessage = useCallback(async (messageId: number) => {
-    await apiDeleteMessage(messageId);
-    setMessages(prevMessages => prevMessages.filter(msg => msg.id !== messageId));
-  }, []);
-
   const value = {
     chats,
     selectedChat,
@@ -315,7 +308,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     sendMessage,
     refreshChats,
     markChatAsRead,
-    deleteMessage,
   };
 
   return <ChatContext.Provider value={value}>{children}</ChatContext.Provider>;
