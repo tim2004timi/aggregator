@@ -63,6 +63,7 @@ OPENAI_TIMEOUT = int(os.getenv("OPENAI_TIMEOUT", "30"))
 XAI_API_KEY = os.getenv("XAI_API_KEY")
 XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-latest")
 XAI_BASE_URL = "https://api.x.ai/v1/chat/completions"
+XAI_PROXY = os.getenv("XAI_PROXY")
 
 # Chats using /test mode (xai model)
 _xai_test_chats: set = set()
@@ -1843,13 +1844,15 @@ async def _ai_openrouter(messages: List[Dict[str, Any]], use_xai: bool = False) 
         "temperature": 0.2,
         "max_tokens": 600,
     }
+    proxy_url = XAI_PROXY if use_xai and XAI_PROXY else None
     current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
     try:
-        logging.info(f"🤖 Sending request to {label} API with model: {model}")
+        logging.info(f"🤖 Sending request to {label} API with model: {model}" + (f" via proxy" if proxy_url else ""))
         async with current_session.post(
             base_url,
             headers=headers,
             json=payload,
+            proxy=proxy_url,
             timeout=aiohttp.ClientTimeout(total=OPENAI_TIMEOUT),
         ) as resp:
             if resp.status != 200:
