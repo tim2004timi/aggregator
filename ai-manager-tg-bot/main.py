@@ -4161,20 +4161,31 @@ async def cmd_test(message: Message):
     if not question.strip():
         await message.answer("Использование: /test <вопрос>\nОтправит вопрос через XAI Grok")
         return
-    messages = [
-        {"role": "system", "content": "Ты — полезный ассистент. Отвечай на русском языке."},
+    json_format = (
+        "\nФормат ответа — ТОЛЬКО JSON без markdown:\n"
+        '{"answer": "твой ответ", "handoff": false, "confidence": 0.8}\n'
+        "answer — текст ответа клиенту, handoff — true если нужен менеджер, "
+        "confidence — уверенность 0.0-1.0."
+    )
+    msgs = [
+        {"role": "system", "content": AI_SUPPORT_PROMPT + json_format},
         {"role": "user", "content": question},
     ]
-    data = await _ai_openrouter(messages, use_xai=True)
+    data = await _ai_openrouter(msgs, use_xai=True)
     if not data:
         await message.answer("❌ Ошибка вызова XAI API")
         return
     try:
-        answer = data["choices"][0]["message"]["content"].strip()
+        content = data["choices"][0]["message"]["content"].strip()
     except Exception:
         await message.answer("❌ Не удалось разобрать ответ XAI")
         return
-    if not answer:
+    parsed = _ai_extract_json(content)
+    if parsed and parsed.get("answer"):
+        answer = str(parsed["answer"]).strip()
+    elif content:
+        answer = content
+    else:
         await message.answer("XAI вернул пустой ответ")
         return
     await message.answer(f"🧪 [{XAI_MODEL}]\n{answer}")
