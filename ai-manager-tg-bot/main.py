@@ -4158,26 +4158,23 @@ async def cmd_test(message: Message):
     if not question.strip():
         await message.answer("Использование: /test <вопрос>\nОтправит вопрос через XAI Grok")
         return
-    async with async_session() as session:
-        chat = await get_chat_by_uuid(session, str(message.chat.id))
-        if not chat:
-            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
-        history = await get_chat_messages(session, chat.id, limit=6)
-        history_text = _ai_build_history(history, max_items=6)
-        ai_result = await _ai_answer_question(
-            session,
-            question,
-            conversation_history=history_text,
-            previous_user_message=_ai_get_previous_user_message(history, question),
-            use_xai=True,
-        )
-        answer = str(ai_result.get("answer") or "").strip()
-        answer = _normalize_price_text(answer)
-        answer = _ai_cleanup_answer(answer)
-        if not answer:
-            await message.answer("XAI не смог ответить на вопрос")
-            return
-        await message.answer(f"🧪 [{XAI_MODEL}]\n{answer}")
+    messages = [
+        {"role": "system", "content": "Ты — полезный ассистент. Отвечай на русском языке."},
+        {"role": "user", "content": question},
+    ]
+    data = await _ai_openrouter(messages, use_xai=True)
+    if not data:
+        await message.answer("❌ Ошибка вызова XAI API")
+        return
+    try:
+        answer = data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        await message.answer("❌ Не удалось разобрать ответ XAI")
+        return
+    if not answer:
+        await message.answer("XAI вернул пустой ответ")
+        return
+    await message.answer(f"🧪 [{XAI_MODEL}]\n{answer}")
 
 @dp.callback_query(F.data.startswith("m:"))
 async def handle_menu_callback(callback: types.CallbackQuery):
