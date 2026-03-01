@@ -4516,6 +4516,171 @@ async def cmd_notifications(message: Message):
         reply_markup=notification_manager.get_notification_keyboard(user_username)
     )
 
+PROMO_ALLOWED_USERNAMES = {"psihpinki", "pshdarkk"}
+_promo_state: Dict[int, Dict[str, Any]] = {}
+
+async def _catalog_post_json(path: str, body: Dict[str, Any]) -> Optional[Any]:
+    base = (CATALOG_API_URL or "").rstrip("/")
+    if not base:
+        return None
+    url = f"{base}{path}"
+    headers: Dict[str, str] = {"Content-Type": "application/json"}
+    token = CATALOG_AUTH_TOKEN
+    if not token and CATALOG_AUTH_USERNAME and CATALOG_AUTH_PASSWORD:
+        token = await _catalog_get_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+    try:
+        async with current_session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status not in (200, 201):
+                text = await resp.text()
+                return {"error": text[:300]}
+            return await resp.json()
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        if current_session != http_session:
+            await current_session.close()
+
+
+@dp.message(Command("promo"))
+async def cmd_promo(message: Message):
+    username = message.from_user.username
+    if not username or username not in PROMO_ALLOWED_USERNAMES:
+        await message.answer("У вас нет доступа к управлению промокодами.")
+        return
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="Процент скидки (%)", callback_data="promo_type:percentage")],
+        [types.InlineKeyboardButton(text="Фиксированная скидка (руб.)", callback_data="promo_type:fixed")],
+        [types.InlineKeyboardButton(text="Список промокодов", callback_data="promo_list")],
+    ])
+    await message.answer("Управление промокодами.\nВыберите тип нового промокода:", reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("promo_type:"))
+async def promo_type_callback(callback: types.CallbackQuery):
+    username = callback.from_user.username
+    if not username or username not in PROMO_ALLOWED_USERNAMES:
+        await callback.answer("Нет доступа")
+        return
+    dtype = callback.data.split(":")[1]
+    _promo_state[callback.from_user.id] = {"step": "code", "discount_type": dtype}
+    await callback.message.answer(f"Тип: {'Процент скидки' if dtype == 'percentage' else 'Фиксированная скидка'}\n\nВведите код промокода (например SALE20):")
+    await callback.answer()
+
+
+@dp.callback_query(lambda c: c.data == "promo_list")
+async def promo_list_callback(callback: types.CallbackQuery):
+    username = callback.from_user.username
+    if not username or username not in PROMO_ALLOWED_USERNAMES:
+        await callback.answer("Нет доступа")
+        return
+    data = await _catalog_get_json("/api/promocodes")
+    if not data or isinstance(data, dict) and data.get("error"):
+        await callback.message.answer("Не удалось загрузить промокоды.")
+        await callback.answer()
+        return
+    if not data:
+        await callback.message.answer("Промокодов пока нет.")
+        await callback.answer()
+        return
+    lines = []
+    for p in data[:20]:
+        status = "ON" if p.get("is_active") else "OFF"
+        dtype = "%" if p.get("discount_type") == "percentage" else "руб."
+        val = p.get("discount_value", "?")
+        used = p.get("used_count", 0)
+        mx = p.get("max_uses") or "~"
+        lines.append(f"[{status}] {p['code']} — {val}{dtype} | {used}/{mx}")
+    text = "Промокоды:\n\n" + "\n".join(lines)
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@dp.message(lambda m: m.from_user and m.from_user.id in _promo_state and m.text and not m.text.startswith("/"))
+async def promo_step_handler(message: Message):
+    uid = message.from_user.id
+    state = _promo_state.get(uid)
+    if not state:
+        return
+    username = message.from_user.username
+    if not username or username not in PROMO_ALLOWED_USERNAMES:
+        _promo_state.pop(uid, None)
+        return
+
+    step = state.get("step")
+    text = message.text.strip()
+
+    if step == "code":
+        state["code"] = text.upper()
+        state["step"] = "value"
+        label = "процент (число от 1 до 99)" if state["discount_type"] == "percentage" else "сумму скидки в рублях"
+        await message.answer(f"Код: {state['code']}\n\nВведите {label}:")
+
+    elif step == "value":
+        try:
+            val = float(text)
+            if val <= 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("Введите положительное число:")
+            return
+        state["discount_value"] = val
+        state["step"] = "max_uses"
+        await message.answer("Введите лимит использований (число) или отправьте 0 для безлимита:")
+
+    elif step == "max_uses":
+        try:
+            mx = int(text)
+        except ValueError:
+            await message.answer("Введите целое число:")
+            return
+        state["max_uses"] = mx if mx > 0 else None
+        state["step"] = "expires"
+        await message.answer("Введите срок действия в формате ДД.ММ.ГГГГ или отправьте 0 для бессрочного:")
+
+    elif step == "expires":
+        expires_at = None
+        if text != "0":
+            try:
+                dt = datetime.strptime(text, "%d.%m.%Y")
+                expires_at = dt.strftime("%Y-%m-%dT23:59:59")
+            except ValueError:
+                await message.answer("Неверный формат. Используйте ДД.ММ.ГГГГ или отправьте 0:")
+                return
+        state["expires_at"] = expires_at
+        state["step"] = "description"
+        await message.answer("Введите описание промокода (или отправьте 0 чтобы пропустить):")
+
+    elif step == "description":
+        description = "" if text == "0" else text
+        body = {
+            "code": state["code"],
+            "discount_type": state["discount_type"],
+            "discount_value": state["discount_value"],
+            "description": description,
+            "max_uses": state["max_uses"],
+            "expires_at": state["expires_at"],
+        }
+        result = await _catalog_post_json("/api/promocodes", body)
+        _promo_state.pop(uid, None)
+        if result and not result.get("error"):
+            dtype_label = "%" if state["discount_type"] == "percentage" else " руб."
+            desc_line = f"Описание: {description}\n" if description else ""
+            await message.answer(
+                f"Промокод создан!\n\n"
+                f"Код: {state['code']}\n"
+                f"Скидка: {state['discount_value']}{dtype_label}\n"
+                f"Лимит: {state['max_uses'] or 'Безлимитный'}\n"
+                f"Срок: {'Бессрочный' if not state['expires_at'] else state['expires_at'][:10]}\n"
+                f"{desc_line}"
+            )
+        else:
+            err = result.get("error", "Неизвестная ошибка") if result else "Нет ответа от API"
+            await message.answer(f"Ошибка создания промокода:\n{err}")
+
+
 @dp.message(F.text)
 async def handle_message(message: Message):
     async with async_session() as session:
