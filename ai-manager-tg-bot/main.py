@@ -3135,8 +3135,10 @@ def build_public_minio_url(file_name: str) -> str:
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # Auto-миграция: добавляем topic_id если его нет
+        # Auto-миграции: добавляем колонки если их нет
         await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS topic_id INTEGER"))
+        await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS mark VARCHAR(20) DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ DEFAULT NULL"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
