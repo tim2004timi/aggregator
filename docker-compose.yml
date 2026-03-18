@@ -2,6 +2,7 @@ services:
   nginx:
     image: nginx:latest
     container_name: nginx
+    restart: always
     ports:
       - "0.0.0.0:80:8080"
       - "0.0.0.0:8080:8080"
@@ -15,6 +16,7 @@ services:
 
   ai-manager-tg-bot:
     container_name: backend
+    restart: always
     depends_on:
       postgres:
         condition: service_healthy
@@ -46,6 +48,7 @@ services:
 
   rus-dialog-space:
     container_name: frontend
+    restart: always
     build:
       context: ./rus-dialog-space
     expose:
@@ -56,6 +59,7 @@ services:
   minio:
     image: minio/minio
     container_name: cloud
+    restart: always
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
@@ -71,6 +75,7 @@ services:
   postgres:
     image: postgres:15
     container_name: postgres
+    restart: always
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: XXxx112233445566
