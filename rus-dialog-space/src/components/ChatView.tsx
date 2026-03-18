@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Message, Chat, getChatMessages, sendMessage as apiSendMessage, toggleAiChat, markChatAsRead, deleteChat, API_URL, fetchWithTokenRefresh, syncVkChat, analyzeChat, getChatAnalytics, DialogAnalytics, assignChat, getCurrentUser, User } from '@/lib/api';
+import { Message, Chat, getChatMessages, sendMessage as apiSendMessage, toggleAiChat, markChatAsRead, deleteChat, API_URL, fetchWithTokenRefresh, syncVkChat, analyzeChat, getChatAnalytics, DialogAnalytics, assignChat, getCurrentUser, User, deleteMessage as apiDeleteMessage, editMessage as apiEditMessage } from '@/lib/api';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical, FileText, StickyNote, Smile, Star } from 'lucide-react';
+import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical, FileText, StickyNote, Smile, Star, Pencil, X, Check } from 'lucide-react';
 import { toast } from '@/components/ui/sonner';
 import {
   AlertDialog,
@@ -30,6 +30,9 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import data from '@emoji-mart/data';
+import Picker from '@emoji-mart/react';
 
 interface ChatViewProps {
   chatId: number | null;
@@ -49,6 +52,7 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analytics, setAnalytics] = useState<DialogAnalytics | null>(null);
   const [showAnalyticsDialog, setShowAnalyticsDialog] = useState(false);
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
   useEffect(() => {
@@ -71,6 +75,24 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     setShouldAutoScroll,
     selectChat: selectChatFromContext,
   } = useChat();
+
+  const handleDeleteMessage = useCallback(async (messageId: number) => {
+    try {
+      await apiDeleteMessage(messageId);
+      toast.success('Сообщение удалено');
+    } catch {
+      toast.error('Не удалось удалить сообщение');
+    }
+  }, []);
+
+  const handleEditMessage = useCallback(async (messageId: number, newText: string) => {
+    try {
+      await apiEditMessage(messageId, newText);
+      toast.success('Сообщение изменено');
+    } catch {
+      toast.error('Не удалось изменить сообщение');
+    }
+  }, []);
 
   // Track the last message timestamp we've seen
   const lastSeenMessageRef = useRef<string>('');
@@ -297,51 +319,55 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     }
   }, [chatId, loadExistingAnalytics]);
 
-  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !selectedChat) return;
-
-    // Check if file is an image
+  const uploadImage = useCallback(async (file: File) => {
+    if (!selectedChat) return;
     if (!file.type.startsWith('image/')) {
       toast.error('Пожалуйста, выберите изображение');
       return;
     }
-
     try {
       const formData = new FormData();
       formData.append('image', file);
       formData.append('chat_id', selectedChat.id.toString());
-
-      console.log('📤 Отправка изображения:', {
-        fileName: file.name,
-        fileSize: file.size,
-        fileType: file.type,
-        chatId: selectedChat.id,
-        formDataEntries: Array.from(formData.entries())
-      });
 
       const response = await fetchWithTokenRefresh(`${API_URL}/messages/image`, {
         method: 'POST',
         body: formData,
       });
 
-      console.log('📥 Ответ сервера:', response.status, response.statusText);
-
       if (!response.ok) {
         const errorText = await response.text();
-        console.error('❌ Ошибка загрузки изображения:', errorText);
+        console.error('Image upload error:', errorText);
         throw new Error(`Failed to upload image: ${response.status} ${response.statusText}`);
       }
 
-      const data = await response.json();
-      console.log('✅ Изображение успешно загружено:', data);
+      await response.json();
       setNewMessage('');
       toast.success('Изображение отправлено');
     } catch (error) {
       console.error('Error uploading image:', error);
       toast.error('Не удалось отправить изображение');
     }
+  }, [selectedChat]);
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    await uploadImage(file);
   };
+
+  const handlePaste = useCallback((e: React.ClipboardEvent) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    for (const item of Array.from(items)) {
+      if (item.type.startsWith('image/')) {
+        e.preventDefault();
+        const file = item.getAsFile();
+        if (file) uploadImage(file);
+        return;
+      }
+    }
+  }, [uploadImage]);
 
   useEffect(() => {
     if (selectedChat && selectedChat.id === chatId) {
@@ -522,10 +548,12 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
             {[...messages]
               .sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())
               .map((message, index) => (
-                <MessageBubble 
+                <MessageBubble
                   key={`${message.id}-${index}`}
-                  message={message} 
+                  message={message}
                   formatTime={formatMessageTime}
+                  onDelete={handleDeleteMessage}
+                  onEdit={handleEditMessage}
                 />
               ))}
             <div ref={messagesEndRef} className="h-1" />
@@ -558,11 +586,37 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
                         type="text"
                         value={newMessage}
                         onChange={(e) => setNewMessage(e.target.value)}
+                        onPaste={handlePaste}
                         placeholder="Написать сообщение..."
                         className="w-full min-h-[40px] py-2 pl-4 pr-4 bg-gray-50 border-gray-200 rounded-xl focus:bg-white transition-colors"
                         disabled={!canWrite}
                     />
                 </div>
+
+                <Popover open={showEmojiPicker} onOpenChange={setShowEmojiPicker}>
+                    <PopoverTrigger asChild>
+                        <button
+                            type="button"
+                            className="text-gray-400 hover:text-gray-600 transition-colors p-2 h-10 w-10 flex items-center justify-center"
+                            disabled={!canWrite}
+                        >
+                            <Smile size={20} />
+                        </button>
+                    </PopoverTrigger>
+                    <PopoverContent side="top" align="end" className="w-auto p-0 border-none shadow-xl">
+                        <Picker
+                            data={data}
+                            onEmojiSelect={(emoji: { native: string }) => {
+                                setNewMessage(prev => prev + emoji.native);
+                                setShowEmojiPicker(false);
+                            }}
+                            locale="ru"
+                            theme="light"
+                            previewPosition="none"
+                            skinTonePosition="none"
+                        />
+                    </PopoverContent>
+                </Popover>
                 
                 <Button
                     type="submit"
@@ -788,21 +842,26 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
 interface MessageBubbleProps {
   message: Message;
   formatTime: (timestamp: string) => string;
+  onDelete?: (messageId: number) => void;
+  onEdit?: (messageId: number, newText: string) => void;
 }
 
-const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
+const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleProps) => {
   const isQuestion = message.message_type === 'question';
+  const isAnswer = message.message_type === 'answer';
   const imageRef = useRef<HTMLImageElement>(null);
   const [open, setOpen] = useState(false);
   const [zoom, setZoom] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
   const [start, setStart] = useState<{ x: number; y: number } | null>(null);
+  const [isEditing, setIsEditing] = useState(false);
+  const [editText, setEditText] = useState(message.message);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   useEffect(() => {
     if (message.is_image && imageRef.current) {
       imageRef.current.onload = () => {
-        // Scroll to bottom after image loads
         const messagesContainer = document.querySelector('.messages-container');
         if (messagesContainer) {
           messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -811,7 +870,6 @@ const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
     }
   }, [message.is_image]);
 
-  // Handlers for zoom and pan
   const handleWheel = (e: React.WheelEvent<HTMLImageElement>) => {
     e.preventDefault();
     setZoom((z) => Math.max(0.5, Math.min(5, z - e.deltaY * 0.001)));
@@ -835,8 +893,60 @@ const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
     }
   };
 
+  const handleSaveEdit = () => {
+    if (editText.trim() && editText !== message.message && onEdit) {
+      onEdit(message.id, editText.trim());
+    }
+    setIsEditing(false);
+  };
+
+  const handleCancelEdit = () => {
+    setEditText(message.message);
+    setIsEditing(false);
+  };
+
+  const handleDeleteConfirm = () => {
+    if (onDelete) onDelete(message.id);
+    setShowDeleteConfirm(false);
+  };
+
   return (
     <div className={`mb-4 flex ${isQuestion ? 'justify-start' : 'justify-end'} group`}>
+      {/* Edit/delete buttons for answer messages (on hover, left side) */}
+      {isAnswer && !message.is_image && !isEditing && (
+        <div className="flex items-center gap-1 mr-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600"
+            onClick={() => { setEditText(message.message); setIsEditing(true); }}
+            title="Редактировать"
+          >
+            <Pencil size={14} />
+          </button>
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-red-100 text-gray-400 hover:text-red-500"
+            onClick={() => setShowDeleteConfirm(true)}
+            title="Удалить"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      )}
+      {/* Delete-only button for answer images */}
+      {isAnswer && message.is_image && (
+        <div className="flex items-center gap-1 mr-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <button
+            type="button"
+            className="p-1 rounded hover:bg-red-100 text-gray-400 hover:text-red-500"
+            onClick={() => setShowDeleteConfirm(true)}
+            title="Удалить"
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      )}
+
       <div className={`max-w-[80%] rounded-lg px-4 py-2 relative ${
         isQuestion ? 'bg-gray-300 text-gray-800' : 'bg-[#1F1F1F] text-white'
       }`}>
@@ -847,7 +957,37 @@ const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
             </div>
           )}
         </div>
-        {message.is_image ? (
+        {isEditing ? (
+          <div className="flex flex-col gap-2">
+            <textarea
+              className="w-full p-2 rounded bg-white/10 text-white border border-white/20 text-sm resize-none focus:outline-none focus:border-white/40"
+              value={editText}
+              onChange={(e) => setEditText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveEdit(); }
+                if (e.key === 'Escape') handleCancelEdit();
+              }}
+              rows={3}
+              autoFocus
+            />
+            <div className="flex gap-1 justify-end">
+              <button
+                type="button"
+                className="p-1 rounded hover:bg-white/20 text-gray-300 hover:text-white"
+                onClick={handleCancelEdit}
+              >
+                <X size={16} />
+              </button>
+              <button
+                type="button"
+                className="p-1 rounded hover:bg-white/20 text-green-400 hover:text-green-300"
+                onClick={handleSaveEdit}
+              >
+                <Check size={16} />
+              </button>
+            </div>
+          </div>
+        ) : message.is_image ? (
           <div className="flex flex-col gap-2">
             <Dialog open={open} onOpenChange={handleDialogOpenChange}>
               <DialogTrigger asChild>
@@ -920,13 +1060,35 @@ const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
         ) : (
           <p className="whitespace-pre-wrap break-words">{message.message}</p>
         )}
-        <div className="text-right mt-1">
+        <div className="text-right mt-1 flex items-center justify-end gap-1">
+          {message.edited_at && (
+            <span className={`text-xs italic ${isQuestion ? 'text-gray-500' : 'text-gray-400'}`}>
+              ред.
+            </span>
+          )}
           <span className={`text-xs ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
             {formatTime(message.created_at)}
           </span>
         </div>
       </div>
 
+      {/* Delete confirmation dialog */}
+      <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+        <AlertDialogContent className="w-[calc(100%-32px)] sm:max-w-[360px] rounded-2xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Удалить сообщение?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Сообщение будет удалено из агрегатора и мессенджера (если возможно).
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="flex-col sm:flex-row gap-2">
+            <AlertDialogCancel className="mt-0">Отмена</AlertDialogCancel>
+            <AlertDialogAction onClick={handleDeleteConfirm} className="bg-red-500 hover:bg-red-600">
+              Удалить
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 };

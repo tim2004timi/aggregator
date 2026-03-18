@@ -6,6 +6,7 @@ export interface Message {
   message_type: 'question' | 'answer' | 'text';
   ai: boolean;
   is_image?: boolean;
+  edited_at?: string | null;
 }
 
 export interface Chat {
@@ -19,6 +20,7 @@ export interface Chat {
   lastMessage?: string;
   lastMessageTime?: string;
   unread?: boolean;
+  mark?: string | null;
 }
 
 export interface WebSocketMessage {

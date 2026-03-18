@@ -1,9 +1,16 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { Chat, getChats, getCurrentUser, User } from '@/lib/api';
-import { CircleDot, MessageSquare, Send, Search } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { Chat, getChats, getCurrentUser, User, updateChatMark } from '@/lib/api';
+import { CircleDot, MessageSquare, Send, Search, Eye, Clock, XCircle } from 'lucide-react';
 import { useWebSocket } from '@/contexts/WebSocketContext';
 import { useChat } from '@/contexts/ChatContext';
 import { Input } from '@/components/ui/input';
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+  ContextMenuSeparator,
+} from '@/components/ui/context-menu';
 
 interface ChatSidebarProps {
   onSelectChat: (chatId: number | null) => void;
@@ -11,8 +18,17 @@ interface ChatSidebarProps {
 }
 
 const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
-  const { chats, loading, unreadCount, selectedChat } = useChat();
+  const { chats, loading, unreadCount, selectedChat, setChats } = useChat();
   const [searchQuery, setSearchQuery] = useState('');
+
+  const handleMarkChange = useCallback(async (chatId: number, mark: string | null) => {
+    try {
+      await updateChatMark(chatId, mark);
+      setChats(prev => prev.map(c => c.id === chatId ? { ...c, mark } : c));
+    } catch {
+      console.error('Failed to update mark');
+    }
+  }, [setChats]);
 
   // Filter chats based on search query
   const filteredChats = chats.filter(chat => {
@@ -88,9 +104,9 @@ const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
                     chat={chat} 
                     isSelected={selectedChat?.id === chat.id} 
                     onClick={() => {
-                      console.log('Sidebar selecting chat:', chat);
                       onSelectChat(chat.id);
-                    }} 
+                    }}
+                    onMarkChange={handleMarkChange}
                   />
                 ))}
               </div>
@@ -110,9 +126,9 @@ const ChatSidebar = ({ onSelectChat, validChatIds }: ChatSidebarProps) => {
                   chat={chat} 
                   isSelected={selectedChat?.id === chat.id} 
                   onClick={() => {
-                    console.log('Sidebar selecting chat:', chat);
                     onSelectChat(chat.id);
-                  }} 
+                  }}
+                  onMarkChange={handleMarkChange}
                 />
               ))}
             </div>
@@ -131,82 +147,131 @@ interface ChatPreviewProps {
   chat: Chat;
   isSelected: boolean;
   onClick: () => void;
+  onMarkChange: (chatId: number, mark: string | null) => void;
 }
 
-const ChatPreview = React.memo(({ chat, isSelected, onClick }: ChatPreviewProps) => {
+const ChatPreview = React.memo(({ chat, isSelected, onClick, onMarkChange }: ChatPreviewProps) => {
   const truncateMessage = (message: string | undefined, maxLength: number = 30) => {
     if (!message) return 'Нет сообщений';
     return message.length > maxLength ? message.substring(0, maxLength) + '...' : message;
   };
   
-  // Format timestamp
   const formatTime = (timestamp: string | undefined) => {
     if (!timestamp) return '';
     const date = new Date(timestamp);
     return date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
   };
+
+  const markBorder = chat.mark === 'unread'
+    ? 'border-l-4 border-l-amber-400'
+    : chat.mark === 'reply_later'
+    ? 'border-l-4 border-l-purple-400'
+    : '';
+
+  const markBg = chat.mark === 'unread'
+    ? 'bg-amber-50/60'
+    : chat.mark === 'reply_later'
+    ? 'bg-purple-50/60'
+    : '';
   
   return (
-    <div 
-      className={`p-4 border-b border-gray-200 cursor-pointer hover:bg-gray-50 transition-colors flex items-start ${isSelected ? 'bg-gray-100' : ''}`}
-      onClick={onClick}
-    >
-      <div className="mr-3 flex-shrink-0 mt-1">
-        <div className="w-10 h-10 rounded-full bg-gray-300 flex items-center justify-center text-gray-600">
-          {chat.messager === 'telegram' ? (
-            <Send size={20} className="text-blue-500" />
-          ) : chat.messager === 'vk' ? (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-              <rect width="24" height="24" rx="6" fill="#2787F5"/>
-              <path d="M17.5 8.5C17.7 7.9 17.5 7.5 16.7 7.5H15.5C15 7.5 14.8 7.8 14.6 8.2C14.6 8.2 13.7 10.1 13.1 10.9C12.9 11.1 12.8 11.2 12.7 11.2C12.6 11.2 12.5 11.1 12.5 10.8V8.5C12.5 8 12.4 7.5 11.6 7.5H9.1C8.7 7.5 8.5 7.7 8.5 8C8.5 8.5 9.2 8.6 9.3 10.1V12.1C9.2 12.4 9 12.5 8.8 12.5C8.5 12.5 7.7 11.5 7.2 10.3C7 9.8 6.8 9.5 6.3 9.5H5.5C5.1 9.5 5 9.7 5 10C5 10.5 5.5 11.7 6.6 13.2C7.7 14.7 9.1 15.5 10.3 15.5C10.7 15.5 10.9 15.3 10.9 14.9V14.1C10.9 13.7 11 13.6 11.3 13.6C11.5 13.6 12 13.7 12.6 14.3C13.4 15.1 13.7 15.5 14.3 15.5H15.5C15.9 15.5 16 15.3 16 15C16 14.5 15.3 14.4 14.7 13.7C14.5 13.5 14.5 13.4 14.7 13.1C14.7 13.1 17.1 10.2 17.5 8.5Z" fill="white"/>
-            </svg>
-          ) : (
-            <MessageSquare size={20} className="text-gray-500" />
-          )}
-        </div>
-      </div>
-      
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center">
-          <h3 className="text-sm font-medium text-gray-900 truncate">
-            {chat.name || `Чат #${chat.uuid}`}
-          </h3>
-          {chat.tags && chat.tags.length > 0 && (
-            <div className="flex gap-1 ml-2 overflow-hidden">
-              {chat.tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded flex-shrink-0"
-                >
-                  {tag}
-                </span>
-              ))}
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div 
+          className={`p-4 border-b border-gray-200 cursor-pointer hover:bg-gray-50 transition-colors flex items-start ${isSelected ? 'bg-gray-100' : markBg} ${markBorder}`}
+          onClick={onClick}
+        >
+          <div className="mr-3 flex-shrink-0 mt-1">
+            <div className="w-10 h-10 rounded-full bg-gray-300 flex items-center justify-center text-gray-600">
+              {chat.messager === 'telegram' ? (
+                <Send size={20} className="text-blue-500" />
+              ) : chat.messager === 'vk' ? (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                  <rect width="24" height="24" rx="6" fill="#2787F5"/>
+                  <path d="M17.5 8.5C17.7 7.9 17.5 7.5 16.7 7.5H15.5C15 7.5 14.8 7.8 14.6 8.2C14.6 8.2 13.7 10.1 13.1 10.9C12.9 11.1 12.8 11.2 12.7 11.2C12.6 11.2 12.5 11.1 12.5 10.8V8.5C12.5 8 12.4 7.5 11.6 7.5H9.1C8.7 7.5 8.5 7.7 8.5 8C8.5 8.5 9.2 8.6 9.3 10.1V12.1C9.2 12.4 9 12.5 8.8 12.5C8.5 12.5 7.7 11.5 7.2 10.3C7 9.8 6.8 9.5 6.3 9.5H5.5C5.1 9.5 5 9.7 5 10C5 10.5 5.5 11.7 6.6 13.2C7.7 14.7 9.1 15.5 10.3 15.5C10.7 15.5 10.9 15.3 10.9 14.9V14.1C10.9 13.7 11 13.6 11.3 13.6C11.5 13.6 12 13.7 12.6 14.3C13.4 15.1 13.7 15.5 14.3 15.5H15.5C15.9 15.5 16 15.3 16 15C16 14.5 15.3 14.4 14.7 13.7C14.5 13.5 14.5 13.4 14.7 13.1C14.7 13.1 17.1 10.2 17.5 8.5Z" fill="white"/>
+                </svg>
+              ) : (
+                <MessageSquare size={20} className="text-gray-500" />
+              )}
             </div>
-          )}
-          <span className="text-xs text-gray-500 ml-auto flex-shrink-0">
-            {chat.lastMessageTime && formatTime(chat.lastMessageTime)}
-          </span>
-        </div>
-        
-        <div className="flex items-center justify-between mt-1">
-          <p className="text-sm text-gray-500 truncate">
-            {truncateMessage(chat.lastMessage)}
-          </p>
+          </div>
           
-          <div className="flex items-center ml-2">
-            {chat.waiting && (
-              <div className="w-2.5 h-2.5 rounded-full bg-blue-500 mr-1" />
-            )}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center">
+              <h3 className="text-sm font-medium text-gray-900 truncate">
+                {chat.name || `Чат #${chat.uuid}`}
+              </h3>
+              {chat.mark === 'unread' && (
+                <span className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 flex-shrink-0">
+                  Не прочитано
+                </span>
+              )}
+              {chat.mark === 'reply_later' && (
+                <span className="ml-1.5 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-purple-100 text-purple-700 flex-shrink-0">
+                  Отвечу позже
+                </span>
+              )}
+              {chat.tags && chat.tags.length > 0 && (
+                <div className="flex gap-1 ml-2 overflow-hidden">
+                  {chat.tags.map((tag) => (
+                    <span
+                      key={tag}
+                      className="text-xs bg-gray-100 text-gray-600 px-2 py-0.5 rounded flex-shrink-0"
+                    >
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
+              <span className="text-xs text-gray-500 ml-auto flex-shrink-0">
+                {chat.lastMessageTime && formatTime(chat.lastMessageTime)}
+              </span>
+            </div>
             
-            {chat.ai && (
-              <div className="text-xs px-1.5 py-0.5 bg-gray-300 text-aiHighlight rounded-sm">
-                ИИ
+            <div className="flex items-center justify-between mt-1">
+              <p className="text-sm text-gray-500 truncate">
+                {truncateMessage(chat.lastMessage)}
+              </p>
+              
+              <div className="flex items-center ml-2">
+                {chat.waiting && (
+                  <div className="w-2.5 h-2.5 rounded-full bg-blue-500 mr-1" />
+                )}
+                
+                {chat.ai && (
+                  <div className="text-xs px-1.5 py-0.5 bg-gray-300 text-aiHighlight rounded-sm">
+                    ИИ
+                  </div>
+                )}
               </div>
-            )}
+            </div>
           </div>
         </div>
-      </div>
-    </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent className="w-48">
+        <ContextMenuItem
+          onClick={() => onMarkChange(chat.id, chat.mark === 'unread' ? null : 'unread')}
+        >
+          <Eye size={14} className="mr-2 text-amber-500" />
+          {chat.mark === 'unread' ? 'Снять «Не прочитано»' : 'Не прочитано'}
+        </ContextMenuItem>
+        <ContextMenuItem
+          onClick={() => onMarkChange(chat.id, chat.mark === 'reply_later' ? null : 'reply_later')}
+        >
+          <Clock size={14} className="mr-2 text-purple-500" />
+          {chat.mark === 'reply_later' ? 'Снять «Отвечу позже»' : 'Отвечу позже'}
+        </ContextMenuItem>
+        {chat.mark && (
+          <>
+            <ContextMenuSeparator />
+            <ContextMenuItem onClick={() => onMarkChange(chat.id, null)}>
+              <XCircle size={14} className="mr-2 text-gray-400" />
+              Снять метку
+            </ContextMenuItem>
+          </>
+        )}
+      </ContextMenuContent>
+    </ContextMenu>
   );
 });
 

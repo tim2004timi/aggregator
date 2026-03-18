@@ -53,6 +53,7 @@ class Chat(Base):
     assigned_manager_name = Column(String(100), nullable=True)
     assigned_at = Column(DateTime(timezone=True), nullable=True)
     dialog_status = Column(String(20), default="new")  # new, assigned, closed
+    mark = Column(String(20), nullable=True, default=None)  # null, "unread", "reply_later"
     messages = relationship("Message", back_populates="chat")
     analytics = relationship("DialogAnalytics", back_populates="chat", uselist=False)
 
@@ -65,6 +66,7 @@ class Message(Base):
     ai = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
     is_image = Column(Boolean, default=False)
+    edited_at = Column(DateTime(timezone=True), nullable=True, default=None)
     chat = relationship("Chat", back_populates="messages")
 
 class AiSettings(Base):
@@ -269,6 +271,7 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
             "assigned_manager_name": chat.assigned_manager_name,
             "assigned_at": chat.assigned_at.isoformat() if chat.assigned_at else None,
             "dialog_status": chat.dialog_status,
+            "mark": chat.mark,
             "last_message": None
         }
         
@@ -307,7 +310,8 @@ async def get_chat_messages(db: AsyncSession, chat_id: int, limit: int = 50, off
             "ai": msg.ai,
             "timestamp": msg.created_at.isoformat() if msg.created_at else None,
             "chatId": str(chat_id),
-            "is_image": msg.is_image
+            "is_image": msg.is_image,
+            "edited_at": msg.edited_at.isoformat() if msg.edited_at else None
         }
         for msg in messages
     ]

@@ -2424,7 +2424,9 @@ async def handle_single_event(event):
     if etype is None and isinstance(event, dict):
         etype = event.get("type")
     etype_str = str(etype).lower()
-    if not (etype == VkBotEventType.MESSAGE_NEW or "message_new" in etype_str):
+    is_incoming = (etype == VkBotEventType.MESSAGE_NEW or "message_new" in etype_str)
+    is_outgoing = (etype == VkBotEventType.MESSAGE_REPLY or "message_reply" in etype_str)
+    if not (is_incoming or is_outgoing):
         return
 
     payload_obj = getattr(event, "object", None)
@@ -2440,6 +2442,101 @@ async def handle_single_event(event):
     user_id = msg['from_id']
     text = msg.get('text', "")
     attachments = msg.get("attachments", [])
+
+    # Outgoing messages from VK community admin panel
+    if is_outgoing or (VK_GROUP_ID and user_id == -VK_GROUP_ID):
+        if not text and not attachments:
+            return
+        async with async_session() as session:
+            chat = await get_chat_by_uuid(session, str(peer_id))
+            if not chat:
+                chat = await create_chat(session, str(peer_id), name=str(peer_id), messager="vk")
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_created",
+                    "chat": {
+                        "id": chat.id, "uuid": chat.uuid, "name": chat.name,
+                        "messager": chat.messager, "waiting": chat.waiting,
+                        "ai": chat.ai, "tags": chat.tags,
+                        "last_message_content": None, "last_message_timestamp": None
+                    }
+                }))
+            if text:
+                db_msg = crud.Message(
+                    chat_id=chat.id, message=text,
+                    message_type="answer", ai=False,
+                    created_at=datetime.utcnow()
+                )
+                session.add(db_msg)
+                await session.commit()
+                await session.refresh(db_msg)
+                await messages_manager.broadcast(json.dumps({
+                    "type": "message",
+                    "chatId": str(db_msg.chat_id),
+                    "content": db_msg.message,
+                    "message_type": db_msg.message_type,
+                    "ai": False,
+                    "timestamp": db_msg.created_at.isoformat(),
+                    "id": db_msg.id
+                }))
+            for att in attachments:
+                if att.get("type") != "photo":
+                    continue
+                photo = att["photo"]
+                url = None
+                for size_key in ['photo_1280', 'photo_807', 'photo_604', 'photo_130', 'photo_75']:
+                    if size_key in photo:
+                        url = photo[size_key]
+                        break
+                if not url and "sizes" in photo:
+                    sizes = photo["sizes"]
+                    max_size = max(sizes, key=lambda s: s["height"])
+                    url = max_size["url"]
+                if not url:
+                    continue
+                try:
+                    current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+                    try:
+                        async with current_session.get(url) as resp:
+                            if resp.status != 200:
+                                continue
+                            content = await resp.read()
+                    finally:
+                        if current_session != http_session:
+                            await current_session.close()
+                    if not content:
+                        continue
+                    file_ext = os.path.splitext(url.split('?')[0])[1] or ".jpg"
+                    file_name = f"{peer_id}-{int(datetime.utcnow().timestamp())}{file_ext}"
+                    file_data = io.BytesIO(content)
+                    file_data.seek(0, 2)
+                    file_size = file_data.tell()
+                    file_data.seek(0)
+                    await asyncio.to_thread(
+                        minio_client.put_object, BUCKET_NAME, file_name,
+                        file_data, file_size, content_type="image/jpeg"
+                    )
+                    img_url = build_public_minio_url(file_name)
+                    db_img = Message(
+                        chat_id=chat.id, message=img_url,
+                        message_type="answer", ai=False,
+                        created_at=datetime.utcnow(), is_image=True
+                    )
+                    session.add(db_img)
+                    await session.commit()
+                    await session.refresh(db_img)
+                    await messages_manager.broadcast(json.dumps({
+                        "type": "message",
+                        "chatId": str(db_img.chat_id),
+                        "content": db_img.message,
+                        "message_type": "answer",
+                        "ai": False,
+                        "timestamp": db_img.created_at.isoformat(),
+                        "id": db_img.id,
+                        "is_image": True
+                    }))
+                except Exception as e:
+                    logging.error(f"Error processing outgoing VK photo: {e}")
+        return
 
     # Получаем информацию о пользователе
     try:
@@ -2691,12 +2788,26 @@ async def handle_single_event(event):
             return
 
         if suppress_ai:
+            if text:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": True
+                }))
             return
         
         # Проверяем, отключен ли AI для этого чата (кроме режима "спросить у ИИ" про товар)
         is_product_mode = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
         if not is_product_mode and (not chat.ai or chat.waiting):
             logging.info(f"🔇 VK AI disabled for chat {chat.id}: ai={chat.ai}, waiting={chat.waiting}")
+            if text and not chat.waiting:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": True
+                }))
             return
         
         extra_context = None
@@ -2825,6 +2936,14 @@ async def handle_single_event(event):
                 )
             except Exception:
                 pass
+
+        # AI ответил, но менеджер должен увидеть диалог как непрочитанный
+        await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+        await updates_manager.broadcast(json.dumps({
+            "type": "chat_update",
+            "chat_id": chat.id,
+            "waiting": True
+        }))
 
         # --- 4) Обработка фото-вложений ---
         for att in attachments:
@@ -3459,6 +3578,26 @@ async def update_ai(chat_id: int, data: AIUpdate, db: AsyncSession = Depends(get
     await updates_manager.broadcast(json.dumps(update_message))
     return chat
 
+class MarkUpdate(BaseModel):
+    mark: Optional[str] = None
+
+@app.put("/api/chats/{chat_id}/mark")
+async def update_mark(chat_id: int, data: MarkUpdate, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    if data.mark is not None and data.mark not in ("unread", "reply_later"):
+        raise HTTPException(status_code=400, detail="mark must be 'unread', 'reply_later' or null")
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    chat.mark = data.mark
+    await db.commit()
+    await db.refresh(chat)
+    await updates_manager.broadcast(json.dumps({
+        "type": "chat_mark_updated",
+        "chat_id": chat_id,
+        "mark": data.mark
+    }))
+    return {"success": True, "chat_id": chat_id, "mark": data.mark}
+
 @app.get("/api/stats")
 @limiter.limit("60/minute")
 async def stats(request: Request, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
@@ -3511,6 +3650,70 @@ async def delete_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool 
     }
     await updates_manager.broadcast(json.dumps(update_message))
     return {"success": True}
+
+@app.delete("/api/messages/{message_id}")
+async def delete_message_endpoint(message_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    result = await db.execute(select(Message).where(Message.id == message_id))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.message_type != "answer":
+        raise HTTPException(status_code=403, detail="Can only delete own (answer) messages")
+    chat = await get_chat(db, msg.chat_id)
+    # Best-effort delete from messenger
+    if chat:
+        try:
+            if chat.messager == "vk" and vk:
+                await asyncio.to_thread(vk.messages.delete, message_ids=[message_id], delete_for_all=1)
+            elif chat.messager == "telegram" and bot:
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                await bot.delete_message(chat_id=tg_chat_id, message_id=message_id)
+        except Exception as e:
+            logging.warning(f"Could not delete message from messenger: {e}")
+    chat_id = msg.chat_id
+    await db.delete(msg)
+    await db.commit()
+    await updates_manager.broadcast(json.dumps({
+        "type": "message_deleted",
+        "message_id": message_id,
+        "chat_id": chat_id
+    }))
+    return {"success": True}
+
+class MessageEdit(BaseModel):
+    message: str
+
+@app.put("/api/messages/{message_id}")
+async def edit_message_endpoint(message_id: int, data: MessageEdit, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
+    result = await db.execute(select(Message).where(Message.id == message_id))
+    msg = result.scalar_one_or_none()
+    if not msg:
+        raise HTTPException(status_code=404, detail="Message not found")
+    if msg.message_type != "answer":
+        raise HTTPException(status_code=403, detail="Can only edit own (answer) messages")
+    chat = await get_chat(db, msg.chat_id)
+    # Best-effort edit in messenger
+    if chat:
+        try:
+            if chat.messager == "vk" and vk:
+                await asyncio.to_thread(vk.messages.edit, peer_id=int(chat.uuid), message_id=message_id, message=data.message)
+            elif chat.messager == "telegram" and bot:
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                await bot.edit_message_text(chat_id=tg_chat_id, message_id=message_id, text=data.message)
+        except Exception as e:
+            logging.warning(f"Could not edit message in messenger: {e}")
+    msg.message = data.message
+    msg.edited_at = datetime.utcnow()
+    await db.commit()
+    await db.refresh(msg)
+    await updates_manager.broadcast(json.dumps({
+        "type": "message_edited",
+        "message_id": message_id,
+        "chat_id": msg.chat_id,
+        "message": data.message,
+        "edited_at": msg.edited_at.isoformat() if msg.edited_at else None
+    }))
+    return {"success": True, "message": msg.message, "edited_at": msg.edited_at.isoformat() if msg.edited_at else None}
 
 @app.post("/api/chats/{chat_id}/sync-vk")
 async def sync_vk_chat(chat_id: int, db: AsyncSession = Depends(get_db), _: bool = Depends(auth.require_auth)):
@@ -4848,12 +5051,25 @@ async def handle_message(message: Message):
             return
 
         if suppress_ai:
+            await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+            await updates_manager.broadcast(json.dumps({
+                "type": "chat_update",
+                "chat_id": chat.id,
+                "waiting": True
+            }))
             return
         
         # Проверяем, отключен ли AI для этого чата (кроме режима "спросить у ИИ" про товар)
         is_product_mode = bool(state.get("mode") == "ask_ai_product" and state.get("product"))
         if not is_product_mode and (not chat.ai or chat.waiting):
             logging.info(f"🔇 TG AI disabled for chat {chat.id}: ai={chat.ai}, waiting={chat.waiting}")
+            if not chat.waiting:
+                await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+                await updates_manager.broadcast(json.dumps({
+                    "type": "chat_update",
+                    "chat_id": chat.id,
+                    "waiting": True
+                }))
             return
         
         try:
@@ -4920,6 +5136,14 @@ async def handle_message(message: Message):
                     )
                 except Exception:
                     pass
+
+            # AI ответил, но менеджер должен увидеть диалог как непрочитанный
+            await update_chat_waiting(db=session, chat_id=chat.id, waiting=True)
+            await updates_manager.broadcast(json.dumps({
+                "type": "chat_update",
+                "chat_id": chat.id,
+                "waiting": True
+            }))
         except Exception as e:
             logging.error(f"Error processing message: {e}")
             await message.answer("Извините, произошла ошибка при обработке запроса")

@@ -5,6 +5,7 @@ import type { WebSocketMessage } from '@/types';
 
 interface ChatContextType {
   chats: Chat[];
+  setChats: React.Dispatch<React.SetStateAction<Chat[]>>;
   selectedChat: Chat | null;
   messages: Message[];
   loading: boolean;
@@ -15,7 +16,6 @@ interface ChatContextType {
   sendMessage: (message: string) => Promise<void>;
   refreshChats: () => Promise<void>;
   markChatAsRead: (chatId: number) => Promise<void>;
-
 }
 
 const ChatContext = createContext<ChatContextType | null>(null);
@@ -178,8 +178,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           String(chat.id) === String(data.chat_id) 
             ? { 
                 ...chat, 
-                waiting: data.waiting,
-                ai: data.ai
+                ...(data.waiting !== undefined ? { waiting: data.waiting } : {}),
+                ...(data.ai !== undefined ? { ai: data.ai } : {}),
               } 
             : chat
         ));
@@ -194,11 +194,25 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
           const newChatsArray = [...updatedChats];
           return newChatsArray;
            });
+      } else if (data.type === 'chat_mark_updated' && data.chat_id !== undefined) {
+        setChats(prevChats => prevChats.map(chat =>
+          String(chat.id) === String(data.chat_id)
+            ? { ...chat, mark: data.mark ?? null }
+            : chat
+        ));
+      } else if (data.type === 'message_deleted' && data.message_id) {
+        setMessages(prev => prev.filter(m => m.id !== data.message_id));
+      } else if (data.type === 'message_edited' && data.message_id) {
+        setMessages(prev => prev.map(m =>
+          m.id === data.message_id
+            ? { ...m, message: data.message, edited_at: data.edited_at }
+            : m
+        ));
       }
     } catch (error) {
       console.error('WS error processing lastUpdate:', error);
     }
-  }, [lastUpdate, fetchStats, selectedChatRef, setChats, setSelectedChat]);
+  }, [lastUpdate, fetchStats, selectedChatRef, setChats, setSelectedChat, setMessages]);
 
   // Начальная загрузка статистики
   useEffect(() => {
@@ -298,6 +312,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const value = {
     chats,
+    setChats,
     selectedChat,
     messages,
     loading,

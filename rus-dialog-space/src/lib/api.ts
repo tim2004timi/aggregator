@@ -137,6 +137,7 @@ export interface Chat {
   assigned_manager_id?: number;
   assigned_manager_name?: string;
   dialog_status?: 'new' | 'assigned' | 'closed';
+  mark?: string | null;
 }
 
 export interface User {
@@ -156,6 +157,7 @@ export interface Message {
   message_type: 'question' | 'answer' | 'text';
   ai: boolean;
   is_image: boolean;
+  edited_at?: string | null;
 }
 
 // Get current user
@@ -240,7 +242,8 @@ export const getChats = async (): Promise<Chat[]> => {
         unread: false, // This should be implemented based on your business logic
         assigned_manager_id: c["assigned_manager_id"] ? Number(c["assigned_manager_id"]) : undefined,
         assigned_manager_name: c["assigned_manager_name"] ? String(c["assigned_manager_name"]) : undefined,
-        dialog_status: (c["dialog_status"] as any) || 'new'
+        dialog_status: (c["dialog_status"] as any) || 'new',
+        mark: (c["mark"] as string | null) ?? null,
       };
     });
   } catch (error) {
@@ -275,6 +278,7 @@ export const getChatMessages = async (chatId: number | string): Promise<Message[
         message_type,
         ai: typeof m["ai"] === "boolean" ? m["ai"] : false,
         is_image: Boolean(m["is_image"]),
+        edited_at: m["edited_at"] ? String(m["edited_at"]) : null,
       };
     });
   } catch (error) {
@@ -385,6 +389,32 @@ export const markChatAsRead = async (chatId: number): Promise<void> => {
   } catch (error) {
     console.error('Error marking chat as read:', error);
   }
+};
+
+export const updateChatMark = async (chatId: number, mark: string | null): Promise<void> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/chats/${chatId}/mark`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ mark }),
+  });
+  if (!response.ok) throw new Error('Failed to update chat mark');
+};
+
+export const deleteMessage = async (messageId: number): Promise<void> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/messages/${messageId}`, {
+    method: 'DELETE',
+    headers: getAuthHeaders(),
+  });
+  if (!response.ok) throw new Error('Failed to delete message');
+};
+
+export const editMessage = async (messageId: number, message: string): Promise<void> => {
+  const response = await fetchWithTokenRefresh(`${API_URL}/messages/${messageId}`, {
+    method: 'PUT',
+    headers: getAuthHeaders(),
+    body: JSON.stringify({ message }),
+  });
+  if (!response.ok) throw new Error('Failed to edit message');
 };
 
 // Get chat statistics
