@@ -67,6 +67,7 @@ class Message(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
     is_image = Column(Boolean, default=False)
     edited_at = Column(DateTime(timezone=True), nullable=True, default=None)
+    external_id = Column(String, nullable=True, default=None)
     chat = relationship("Chat", back_populates="messages")
 
 class AiSettings(Base):

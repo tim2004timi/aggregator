@@ -3139,6 +3139,7 @@ async def init_db():
         await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS topic_id INTEGER"))
         await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS mark VARCHAR(20) DEFAULT NULL"))
         await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_id VARCHAR DEFAULT NULL"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -3479,6 +3480,7 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
     # 3. Отправляем сообщение в соответствующий мессенджер (best-effort)
     delivered = True
     delivery_error: Optional[str] = None
+    ext_id: Optional[str] = None
     try:
         if chat.messager == "telegram":
             if not bot:
@@ -3486,22 +3488,29 @@ async def create_message_endpoint(msg: MessageCreate, db: AsyncSession = Depends
                 delivery_error = "Telegram bot is not configured (BOT_TOKEN missing)"
             else:
                 tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
-                await bot.send_message(chat_id=tg_chat_id, text=msg.message)
+                sent = await bot.send_message(chat_id=tg_chat_id, text=msg.message)
+                ext_id = str(sent.message_id)
         elif chat.messager == "vk":
             if not vk:
                 delivered = False
                 delivery_error = "VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)"
             else:
-                await asyncio.to_thread(
+                vk_msg_id = await asyncio.to_thread(
                     vk.messages.send,
                     peer_id=int(chat.uuid),
                     message=msg.message,
                     random_id=0
                 )
+                ext_id = str(vk_msg_id)
     except Exception as e:
         delivered = False
         delivery_error = str(e)
         logging.error(f"Error sending message to {chat.messager}: {e}")
+
+    if ext_id:
+        db_msg.external_id = ext_id
+        await db.commit()
+        await db.refresh(db_msg)
 
     if msg.message_type == "answer":
         await update_chat_waiting(db, msg.chat_id, False)
@@ -3662,14 +3671,13 @@ async def delete_message_endpoint(message_id: int, db: AsyncSession = Depends(ge
     if msg.message_type != "answer":
         raise HTTPException(status_code=403, detail="Can only delete own (answer) messages")
     chat = await get_chat(db, msg.chat_id)
-    # Best-effort delete from messenger
-    if chat:
+    if chat and msg.external_id:
         try:
             if chat.messager == "vk" and vk:
-                await asyncio.to_thread(vk.messages.delete, message_ids=[message_id], delete_for_all=1)
+                await asyncio.to_thread(vk.messages.delete, message_ids=[int(msg.external_id)], delete_for_all=1)
             elif chat.messager == "telegram" and bot:
                 tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
-                await bot.delete_message(chat_id=tg_chat_id, message_id=message_id)
+                await bot.delete_message(chat_id=tg_chat_id, message_id=int(msg.external_id))
         except Exception as e:
             logging.warning(f"Could not delete message from messenger: {e}")
     chat_id = msg.chat_id
@@ -3694,14 +3702,13 @@ async def edit_message_endpoint(message_id: int, data: MessageEdit, db: AsyncSes
     if msg.message_type != "answer":
         raise HTTPException(status_code=403, detail="Can only edit own (answer) messages")
     chat = await get_chat(db, msg.chat_id)
-    # Best-effort edit in messenger
-    if chat:
+    if chat and msg.external_id:
         try:
             if chat.messager == "vk" and vk:
-                await asyncio.to_thread(vk.messages.edit, peer_id=int(chat.uuid), message_id=message_id, message=data.message)
+                await asyncio.to_thread(vk.messages.edit, peer_id=int(chat.uuid), message_id=int(msg.external_id), message=data.message)
             elif chat.messager == "telegram" and bot:
                 tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
-                await bot.edit_message_text(chat_id=tg_chat_id, message_id=message_id, text=data.message)
+                await bot.edit_message_text(chat_id=tg_chat_id, message_id=int(msg.external_id), text=data.message)
         except Exception as e:
             logging.warning(f"Could not edit message in messenger: {e}")
     msg.message = data.message
@@ -4018,27 +4025,25 @@ async def upload_image(
     # 6. Отправляем фотографию в соответствующий мессенджер (best-effort)
     delivered = True
     delivery_error: Optional[str] = None
+    ext_id: Optional[str] = None
     try:
         if chat.messager == "telegram":
             if not bot:
                 delivered = False
                 delivery_error = "Telegram bot is not configured (BOT_TOKEN missing)"
                 raise RuntimeError(delivery_error)
-            # Создаем временный файл для отправки в Telegram
             with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
                 temp_file.write(content)
                 temp_file.flush()
-                # Отправка в Telegram
                 tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
-                await bot.send_photo(chat_id=tg_chat_id, photo=FSInputFile(temp_file.name))
-            # Удаляем временный файл
+                sent = await bot.send_photo(chat_id=tg_chat_id, photo=FSInputFile(temp_file.name))
+                ext_id = str(sent.message_id)
             os.unlink(temp_file.name)
         elif chat.messager == "vk":
             if not vk:
                 delivered = False
                 delivery_error = "VK bot is not configured (VK_TOKEN/VK_GROUP_ID missing)"
                 raise RuntimeError(delivery_error)
-            # Загружаем фото на сервер VK
             upload_url = await asyncio.to_thread(
                 vk.photos.getMessagesUploadServer
             )
@@ -4055,7 +4060,6 @@ async def upload_image(
             finally:
                 if current_session != http_session: await current_session.close()
 
-            # Сохраняем фото на сервере VK
             photo_data = await asyncio.to_thread(
                 vk.photos.saveMessagesPhoto,
                 photo=upload_result['photo'],
@@ -4063,17 +4067,22 @@ async def upload_image(
                 hash=upload_result['hash']
             )
 
-            # Отправляем сообщение с фото в VK
-            await asyncio.to_thread(
+            vk_msg_id = await asyncio.to_thread(
                 vk.messages.send,
                 peer_id=int(chat.uuid),
                 attachment=f"photo{photo_data[0]['owner_id']}_{photo_data[0]['id']}",
                 random_id=0
             )
+            ext_id = str(vk_msg_id)
     except Exception as e:
         delivered = False
         delivery_error = str(e)
         logging.error(f"Error sending photo to {chat.messager}: {e}")
+
+    if ext_id:
+        db_img.external_id = ext_id
+        await db.commit()
+        await db.refresh(db_img)
 
     # 7. Отправляем сообщение через WebSocket
     message_for_frontend = {
