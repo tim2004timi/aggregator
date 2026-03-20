@@ -54,6 +54,7 @@ class Chat(Base):
     assigned_at = Column(DateTime(timezone=True), nullable=True)
     dialog_status = Column(String(20), default="new")  # new, assigned, closed
     mark = Column(String(20), nullable=True, default=None)  # null, "unread", "reply_later"
+    archived = Column(Boolean, default=False, server_default="false")
     messages = relationship("Message", back_populates="chat")
     analytics = relationship("DialogAnalytics", back_populates="chat", uselist=False)
 
@@ -228,9 +229,10 @@ async def save_ai_knowledge(db: AsyncSession, data: Any) -> AiKnowledge:
     return knowledge
 
 async def get_stats(db: AsyncSession):
-    total = await db.scalar(select(func.count(Chat.id)))
-    pending = await db.scalar(select(func.count(Chat.id)).filter(Chat.waiting == True))
-    ai_count = await db.scalar(select(func.count(Chat.id)).filter(Chat.ai == True))
+    active_filter = Chat.archived == False
+    total = await db.scalar(select(func.count(Chat.id)).filter(active_filter))
+    pending = await db.scalar(select(func.count(Chat.id)).filter(active_filter, Chat.waiting == True))
+    ai_count = await db.scalar(select(func.count(Chat.id)).filter(active_filter, Chat.ai == True))
     return {"total": total, "pending": pending, "ai": ai_count}
 
 async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> List[Dict[str, Any]]:
@@ -249,6 +251,7 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
         select(Chat, Message)
         .outerjoin(last_msg_ids, last_msg_ids.c.chat_id == Chat.id)
         .outerjoin(Message, Message.id == last_msg_ids.c.last_id)
+        .filter(Chat.archived == False)
         .order_by(desc(Chat.id))
     )
     
@@ -273,6 +276,7 @@ async def get_chats_with_last_messages(db: AsyncSession, limit: int = 10000) -> 
             "assigned_at": chat.assigned_at.isoformat() if chat.assigned_at else None,
             "dialog_status": chat.dialog_status,
             "mark": chat.mark,
+            "archived": chat.archived,
             "last_message": None
         }
         

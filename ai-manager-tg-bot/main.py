@@ -2580,6 +2580,23 @@ async def handle_single_event(event):
                 }
             }
             await updates_manager.broadcast(json.dumps(new_chat_message))
+        elif chat.archived:
+            chat.archived = False
+            await session.commit()
+            await updates_manager.broadcast(json.dumps({
+                "type": "chat_created",
+                "chat": {
+                    "id": chat.id,
+                    "uuid": chat.uuid,
+                    "name": chat.name,
+                    "messager": chat.messager,
+                    "waiting": chat.waiting,
+                    "ai": chat.ai,
+                    "tags": chat.tags,
+                    "last_message_content": None,
+                    "last_message_timestamp": None
+                }
+            }))
 
         payload_raw = msg.get("payload")
         payload_data: Optional[Dict[str, Any]] = None
@@ -3140,6 +3157,7 @@ async def init_db():
         await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS mark VARCHAR(20) DEFAULT NULL"))
         await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ DEFAULT NULL"))
         await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_id VARCHAR DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -3945,6 +3963,34 @@ async def get_chat_analytics_endpoint(
         "dialog_duration_minutes": analytics.dialog_duration_minutes,
         "created_at": analytics.created_at.isoformat() if analytics.created_at else None
     }
+
+
+@app.post("/api/chats/archive-broadcast")
+async def archive_broadcast_chats(
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    """Архивирует VK-чаты, в которых нет ответов от клиента (только исходящие сообщения рассылки)."""
+    chats_with_questions = (
+        select(Message.chat_id)
+        .where(Message.message_type == "question")
+        .distinct()
+        .subquery()
+    )
+    result = await db.execute(
+        select(crud.Chat)
+        .where(
+            crud.Chat.messager == "vk",
+            crud.Chat.archived == False,
+            crud.Chat.id.notin_(select(chats_with_questions.c.chat_id))
+        )
+    )
+    chats_to_archive = result.scalars().all()
+    count = len(chats_to_archive)
+    for chat in chats_to_archive:
+        chat.archived = True
+    await db.commit()
+    return {"archived_count": count}
 
 
 @app.get("/api/analytics")

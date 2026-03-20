@@ -21,6 +21,7 @@ export interface Chat {
   lastMessageTime?: string;
   unread?: boolean;
   mark?: string | null;
+  archived?: boolean;
 }
 
 export interface WebSocketMessage {

@@ -138,6 +138,7 @@ export interface Chat {
   assigned_manager_name?: string;
   dialog_status?: 'new' | 'assigned' | 'closed';
   mark?: string | null;
+  archived?: boolean;
 }
 
 export interface User {
@@ -244,6 +245,7 @@ export const getChats = async (): Promise<Chat[]> => {
         assigned_manager_name: c["assigned_manager_name"] ? String(c["assigned_manager_name"]) : undefined,
         dialog_status: (c["dialog_status"] as any) || 'new',
         mark: (c["mark"] as string | null) ?? null,
+        archived: Boolean(c["archived"]),
       };
     });
   } catch (error) {
