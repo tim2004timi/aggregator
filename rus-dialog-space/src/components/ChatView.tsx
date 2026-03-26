@@ -545,6 +545,18 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     }
   }, []);
 
+  const stopVideoStream = useCallback(() => {
+    videoStreamRef.current?.getTracks().forEach(t => t.stop());
+    videoStreamRef.current = null;
+    setShowVideoRecorder(false);
+    setIsRecordingVideo(false);
+    setVideoRecordingTime(0);
+    if (videoTimerRef.current) {
+      clearInterval(videoTimerRef.current);
+      videoTimerRef.current = null;
+    }
+  }, []);
+
   const beginVideoCapture = useCallback(() => {
     if (!videoStreamRef.current) return;
     const recorder = new MediaRecorder(videoStreamRef.current, {
@@ -583,18 +595,6 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
       videoTimerRef.current = null;
     }
     setIsRecordingVideo(false);
-  }, []);
-
-  const stopVideoStream = useCallback(() => {
-    videoStreamRef.current?.getTracks().forEach(t => t.stop());
-    videoStreamRef.current = null;
-    setShowVideoRecorder(false);
-    setIsRecordingVideo(false);
-    setVideoRecordingTime(0);
-    if (videoTimerRef.current) {
-      clearInterval(videoTimerRef.current);
-      videoTimerRef.current = null;
-    }
   }, []);
 
   const cancelVideoRecording = useCallback(() => {
