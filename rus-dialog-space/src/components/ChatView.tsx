@@ -1201,6 +1201,198 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
   );
 };
 
+const VoicePlayer = ({ src, duration, isQuestion }: { src: string; duration?: number | null; isQuestion: boolean }) => {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [totalDuration, setTotalDuration] = useState(duration || 0);
+
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (playing) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play();
+    }
+    setPlaying(!playing);
+  };
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const handleTimeUpdate = () => {
+    if (audioRef.current) {
+      setCurrentTime(audioRef.current.currentTime);
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (audioRef.current && audioRef.current.duration && isFinite(audioRef.current.duration)) {
+      setTotalDuration(audioRef.current.duration);
+    }
+  };
+
+  const handleEnded = () => setPlaying(false);
+
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!audioRef.current || !totalDuration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    audioRef.current.currentTime = ratio * totalDuration;
+  };
+
+  const progress = totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0;
+
+  return (
+    <div className="flex items-center gap-2 min-w-[200px]">
+      <audio
+        ref={audioRef}
+        src={src}
+        onTimeUpdate={handleTimeUpdate}
+        onLoadedMetadata={handleLoadedMetadata}
+        onEnded={handleEnded}
+        preload="metadata"
+      />
+      <button
+        type="button"
+        onClick={togglePlay}
+        className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 transition-colors ${
+          isQuestion ? 'bg-gray-400 hover:bg-gray-500 text-white' : 'bg-white/20 hover:bg-white/30 text-white'
+        }`}
+      >
+        {playing ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
+      </button>
+      <div className="flex-1 flex flex-col gap-1">
+        <div
+          className="h-1.5 rounded-full cursor-pointer relative overflow-hidden"
+          style={{ backgroundColor: isQuestion ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.2)' }}
+          onClick={handleSeek}
+        >
+          <div
+            className="absolute inset-y-0 left-0 rounded-full transition-[width]"
+            style={{
+              width: `${progress}%`,
+              backgroundColor: isQuestion ? '#374151' : '#ffffff'
+            }}
+          />
+        </div>
+        <span className={`text-[10px] font-mono ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
+          {formatTime(currentTime)} / {formatTime(totalDuration)}
+        </span>
+      </div>
+    </div>
+  );
+};
+
+const VideoNotePlayer = ({ src }: { src: string }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [playing, setPlaying] = useState(false);
+
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (playing) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play();
+    }
+    setPlaying(!playing);
+  };
+
+  return (
+    <div className="relative cursor-pointer group/video" onClick={togglePlay}>
+      <video
+        ref={videoRef}
+        src={src}
+        className="w-48 h-48 sm:w-56 sm:h-56 rounded-full object-cover"
+        playsInline
+        onEnded={() => setPlaying(false)}
+        preload="metadata"
+      />
+      {!playing && (
+        <div className="absolute inset-0 flex items-center justify-center rounded-full bg-black/20 group-hover/video:bg-black/30 transition-colors">
+          <div className="h-12 w-12 rounded-full bg-white/80 flex items-center justify-center">
+            <Play size={24} className="text-gray-800 ml-1" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const FILE_ICON_COLORS: Record<string, string> = {
+  pdf: 'bg-red-100 text-red-600',
+  doc: 'bg-blue-100 text-blue-600',
+  docx: 'bg-blue-100 text-blue-600',
+  xls: 'bg-green-100 text-green-600',
+  xlsx: 'bg-green-100 text-green-600',
+  ppt: 'bg-orange-100 text-orange-600',
+  pptx: 'bg-orange-100 text-orange-600',
+  zip: 'bg-yellow-100 text-yellow-700',
+  rar: 'bg-yellow-100 text-yellow-700',
+  '7z': 'bg-yellow-100 text-yellow-700',
+  txt: 'bg-gray-100 text-gray-600',
+  csv: 'bg-green-100 text-green-700',
+};
+
+const FileAttachment = ({
+  src,
+  fileName,
+  fileSize,
+  isQuestion,
+}: {
+  src: string;
+  fileName?: string | null;
+  fileSize?: number | null;
+  isQuestion: boolean;
+}) => {
+  const name = fileName || 'Файл';
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  const iconColor = FILE_ICON_COLORS[ext] || 'bg-gray-100 text-gray-500';
+
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} Б`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+  };
+
+  return (
+    <a
+      href={src}
+      target="_blank"
+      rel="noopener noreferrer"
+      download={name}
+      className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors min-w-[200px] ${
+        isQuestion
+          ? 'bg-gray-200/60 hover:bg-gray-200'
+          : 'bg-white/10 hover:bg-white/20'
+      }`}
+    >
+      <div className={`h-10 w-10 rounded-lg flex items-center justify-center flex-shrink-0 ${iconColor}`}>
+        <FileText size={20} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className={`text-sm font-medium truncate ${isQuestion ? 'text-gray-800' : 'text-white'}`}>
+          {name}
+        </p>
+        <div className="flex items-center gap-2">
+          {fileSize != null && (
+            <span className={`text-xs ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
+              {formatSize(fileSize)}
+            </span>
+          )}
+          <span className={`text-xs uppercase ${isQuestion ? 'text-gray-400' : 'text-gray-400'}`}>
+            {ext}
+          </span>
+        </div>
+      </div>
+      <Download size={16} className={`flex-shrink-0 ${isQuestion ? 'text-gray-400' : 'text-gray-300'}`} />
+    </a>
+  );
+};
+
 interface MessageBubbleProps {
   message: Message;
   formatTime: (timestamp: string) => string;
@@ -1463,198 +1655,6 @@ const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleP
         </AlertDialogContent>
       </AlertDialog>
     </div>
-  );
-};
-
-const VoicePlayer = ({ src, duration, isQuestion }: { src: string; duration?: number | null; isQuestion: boolean }) => {
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const [playing, setPlaying] = useState(false);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [totalDuration, setTotalDuration] = useState(duration || 0);
-
-  const togglePlay = () => {
-    if (!audioRef.current) return;
-    if (playing) {
-      audioRef.current.pause();
-    } else {
-      audioRef.current.play();
-    }
-    setPlaying(!playing);
-  };
-
-  const formatTime = (seconds: number) => {
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  };
-
-  const handleTimeUpdate = () => {
-    if (audioRef.current) {
-      setCurrentTime(audioRef.current.currentTime);
-    }
-  };
-
-  const handleLoadedMetadata = () => {
-    if (audioRef.current && audioRef.current.duration && isFinite(audioRef.current.duration)) {
-      setTotalDuration(audioRef.current.duration);
-    }
-  };
-
-  const handleEnded = () => setPlaying(false);
-
-  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (!audioRef.current || !totalDuration) return;
-    const rect = e.currentTarget.getBoundingClientRect();
-    const ratio = (e.clientX - rect.left) / rect.width;
-    audioRef.current.currentTime = ratio * totalDuration;
-  };
-
-  const progress = totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0;
-
-  return (
-    <div className="flex items-center gap-2 min-w-[200px]">
-      <audio
-        ref={audioRef}
-        src={src}
-        onTimeUpdate={handleTimeUpdate}
-        onLoadedMetadata={handleLoadedMetadata}
-        onEnded={handleEnded}
-        preload="metadata"
-      />
-      <button
-        type="button"
-        onClick={togglePlay}
-        className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 transition-colors ${
-          isQuestion ? 'bg-gray-400 hover:bg-gray-500 text-white' : 'bg-white/20 hover:bg-white/30 text-white'
-        }`}
-      >
-        {playing ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
-      </button>
-      <div className="flex-1 flex flex-col gap-1">
-        <div
-          className="h-1.5 rounded-full cursor-pointer relative overflow-hidden"
-          style={{ backgroundColor: isQuestion ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.2)' }}
-          onClick={handleSeek}
-        >
-          <div
-            className="absolute inset-y-0 left-0 rounded-full transition-[width]"
-            style={{
-              width: `${progress}%`,
-              backgroundColor: isQuestion ? '#374151' : '#ffffff'
-            }}
-          />
-        </div>
-        <span className={`text-[10px] font-mono ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
-          {formatTime(currentTime)} / {formatTime(totalDuration)}
-        </span>
-      </div>
-    </div>
-  );
-};
-
-const VideoNotePlayer = ({ src }: { src: string }) => {
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const [playing, setPlaying] = useState(false);
-
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (playing) {
-      videoRef.current.pause();
-    } else {
-      videoRef.current.play();
-    }
-    setPlaying(!playing);
-  };
-
-  return (
-    <div className="relative cursor-pointer group/video" onClick={togglePlay}>
-      <video
-        ref={videoRef}
-        src={src}
-        className="w-48 h-48 sm:w-56 sm:h-56 rounded-full object-cover"
-        playsInline
-        onEnded={() => setPlaying(false)}
-        preload="metadata"
-      />
-      {!playing && (
-        <div className="absolute inset-0 flex items-center justify-center rounded-full bg-black/20 group-hover/video:bg-black/30 transition-colors">
-          <div className="h-12 w-12 rounded-full bg-white/80 flex items-center justify-center">
-            <Play size={24} className="text-gray-800 ml-1" />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const FILE_ICON_COLORS: Record<string, string> = {
-  pdf: 'bg-red-100 text-red-600',
-  doc: 'bg-blue-100 text-blue-600',
-  docx: 'bg-blue-100 text-blue-600',
-  xls: 'bg-green-100 text-green-600',
-  xlsx: 'bg-green-100 text-green-600',
-  ppt: 'bg-orange-100 text-orange-600',
-  pptx: 'bg-orange-100 text-orange-600',
-  zip: 'bg-yellow-100 text-yellow-700',
-  rar: 'bg-yellow-100 text-yellow-700',
-  '7z': 'bg-yellow-100 text-yellow-700',
-  txt: 'bg-gray-100 text-gray-600',
-  csv: 'bg-green-100 text-green-700',
-};
-
-const FileAttachment = ({
-  src,
-  fileName,
-  fileSize,
-  isQuestion,
-}: {
-  src: string;
-  fileName?: string | null;
-  fileSize?: number | null;
-  isQuestion: boolean;
-}) => {
-  const name = fileName || 'Файл';
-  const ext = name.split('.').pop()?.toLowerCase() || '';
-  const iconColor = FILE_ICON_COLORS[ext] || 'bg-gray-100 text-gray-500';
-
-  const formatSize = (bytes: number) => {
-    if (bytes < 1024) return `${bytes} Б`;
-    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
-    return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
-  };
-
-  return (
-    <a
-      href={src}
-      target="_blank"
-      rel="noopener noreferrer"
-      download={name}
-      className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors min-w-[200px] ${
-        isQuestion
-          ? 'bg-gray-200/60 hover:bg-gray-200'
-          : 'bg-white/10 hover:bg-white/20'
-      }`}
-    >
-      <div className={`h-10 w-10 rounded-lg flex items-center justify-center flex-shrink-0 ${iconColor}`}>
-        <FileText size={20} />
-      </div>
-      <div className="flex-1 min-w-0">
-        <p className={`text-sm font-medium truncate ${isQuestion ? 'text-gray-800' : 'text-white'}`}>
-          {name}
-        </p>
-        <div className="flex items-center gap-2">
-          {fileSize != null && (
-            <span className={`text-xs ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
-              {formatSize(fileSize)}
-            </span>
-          )}
-          <span className={`text-xs uppercase ${isQuestion ? 'text-gray-400' : 'text-gray-400'}`}>
-            {ext}
-          </span>
-        </div>
-      </div>
-      <Download size={16} className={`flex-shrink-0 ${isQuestion ? 'text-gray-400' : 'text-gray-300'}`} />
-    </a>
   );
 };
 
