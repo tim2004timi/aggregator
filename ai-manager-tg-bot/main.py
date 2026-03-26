@@ -3138,6 +3138,47 @@ minio_client = Minio(
     secure=False  # True для HTTPS
 )
 
+ALLOWED_FILE_EXTENSIONS = {
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".txt", ".csv", ".rtf", ".odt", ".ods", ".odp",
+    ".zip", ".rar", ".7z", ".tar", ".gz",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".tiff",
+    ".mp3", ".wav", ".ogg", ".flac", ".aac",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".json", ".xml", ".html", ".css", ".md",
+}
+
+ALLOWED_FILE_CONTENT_TYPES = {
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.ms-excel",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/plain", "text/csv", "text/html", "text/css", "text/markdown", "text/xml",
+    "application/rtf",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/zip", "application/x-rar-compressed", "application/x-7z-compressed",
+    "application/gzip", "application/x-tar",
+    "image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp", "image/svg+xml", "image/tiff",
+    "audio/mpeg", "audio/wav", "audio/ogg", "audio/flac", "audio/aac",
+    "video/mp4", "video/quicktime", "video/x-msvideo", "video/x-matroska", "video/webm",
+    "application/json", "application/xml",
+    "application/octet-stream",
+}
+
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+
+
+def _is_file_allowed(filename: str) -> bool:
+    if not filename:
+        return False
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ALLOWED_FILE_EXTENSIONS
+
 def build_public_minio_url(file_name: str) -> str:
     """
     Не возвращаем прямой URL на :9000 (он обычно закрыт извне).
@@ -3158,6 +3199,10 @@ async def init_db():
         await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS edited_at TIMESTAMPTZ DEFAULT NULL"))
         await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS external_id VARCHAR DEFAULT NULL"))
         await conn.execute(sa_text("ALTER TABLE chats ADD COLUMN IF NOT EXISTS archived BOOLEAN DEFAULT FALSE"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_type VARCHAR DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS media_duration INTEGER DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_name VARCHAR DEFAULT NULL"))
+        await conn.execute(sa_text("ALTER TABLE messages ADD COLUMN IF NOT EXISTS file_size INTEGER DEFAULT NULL"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -4062,7 +4107,8 @@ async def upload_image(
         message_type="answer",
         ai=False,
         created_at=datetime.utcnow(),
-        is_image=True
+        is_image=True,
+        media_type="image"
     )
     db.add(db_img)
     await db.commit()
@@ -4139,7 +4185,8 @@ async def upload_image(
         "ai": db_img.ai,
         "timestamp": db_img.created_at.isoformat(),
         "id": db_img.id,
-        "is_image": True
+        "is_image": True,
+        "media_type": "image"
     }
     await messages_manager.broadcast(json.dumps(message_for_frontend))
 
@@ -4157,6 +4204,403 @@ async def upload_image(
             logging.error("Failed to forward web-dashboard photo to forum: %s", e)
 
     return {"message": db_img, "delivered": delivered, "delivery_error": delivery_error}
+
+
+@app.post("/api/messages/voice")
+async def upload_voice(
+    voice: UploadFile = File(...),
+    chat_id: int = Form(...),
+    duration: int = Form(0),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    content = await voice.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    file_ext = os.path.splitext(voice.filename or "audio.ogg")[1] or ".ogg"
+    file_name = f"voice-{chat.uuid}-{int(datetime.utcnow().timestamp())}{file_ext}"
+
+    try:
+        await asyncio.to_thread(
+            minio_client.put_object,
+            BUCKET_NAME,
+            file_name,
+            io.BytesIO(content),
+            len(content),
+            content_type=voice.content_type or "audio/ogg"
+        )
+        voice_url = build_public_minio_url(file_name)
+    except Exception as e:
+        logging.error(f"MinIO voice upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload voice")
+
+    db_voice = Message(
+        chat_id=chat_id,
+        message=voice_url,
+        message_type="answer",
+        ai=False,
+        created_at=datetime.utcnow(),
+        is_image=False,
+        media_type="voice",
+        media_duration=duration or None
+    )
+    db.add(db_voice)
+    await db.commit()
+    await db.refresh(db_voice)
+
+    delivered = True
+    delivery_error: Optional[str] = None
+    ext_id: Optional[str] = None
+    try:
+        if chat.messager == "telegram":
+            if not bot:
+                delivered = False
+                delivery_error = "Telegram bot is not configured"
+                raise RuntimeError(delivery_error)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+                temp_file.write(content)
+                temp_file.flush()
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                sent = await bot.send_voice(chat_id=tg_chat_id, voice=FSInputFile(temp_file.name), duration=duration or None)
+                ext_id = str(sent.message_id)
+            os.unlink(temp_file.name)
+        elif chat.messager == "vk":
+            if not vk:
+                delivered = False
+                delivery_error = "VK bot is not configured"
+                raise RuntimeError(delivery_error)
+            upload_server = await asyncio.to_thread(
+                vk.docs.getMessagesUploadServer, type='audio_message', peer_id=int(chat.uuid)
+            )
+            upload_url = upload_server['upload_url']
+            current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+            try:
+                form = aiohttp.FormData()
+                form.add_field('file', content, filename='voice.ogg', content_type='audio/ogg')
+                async with current_session.post(upload_url, data=form) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"VK voice upload failed: {resp.status}")
+                    upload_result = await resp.json()
+            finally:
+                if current_session != http_session:
+                    await current_session.close()
+            doc_data = await asyncio.to_thread(
+                vk.docs.save, file=upload_result['file']
+            )
+            doc = doc_data['audio_message']
+            vk_msg_id = await asyncio.to_thread(
+                vk.messages.send,
+                peer_id=int(chat.uuid),
+                attachment=f"doc{doc['owner_id']}_{doc['id']}",
+                random_id=0
+            )
+            ext_id = str(vk_msg_id)
+    except Exception as e:
+        delivered = False
+        delivery_error = str(e)
+        logging.error(f"Error sending voice to {chat.messager}: {e}")
+
+    if ext_id:
+        db_voice.external_id = ext_id
+        await db.commit()
+        await db.refresh(db_voice)
+
+    message_for_frontend = {
+        "type": "message",
+        "chatId": str(db_voice.chat_id),
+        "content": db_voice.message,
+        "message_type": db_voice.message_type,
+        "ai": db_voice.ai,
+        "timestamp": db_voice.created_at.isoformat(),
+        "id": db_voice.id,
+        "is_image": False,
+        "media_type": "voice",
+        "media_duration": db_voice.media_duration
+    }
+    await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+    if FORUM_GROUP_ID and bot and chat.topic_id:
+        try:
+            voice_input = BufferedInputFile(content, filename=file_name)
+            await bot.send_voice(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=chat.topic_id,
+                voice=voice_input,
+                caption="[Менеджер (веб)]: Голосовое сообщение"
+            )
+        except Exception as e:
+            logging.error("Failed to forward web-dashboard voice to forum: %s", e)
+
+    return {"message": db_voice, "delivered": delivered, "delivery_error": delivery_error}
+
+
+@app.post("/api/messages/video_note")
+async def upload_video_note(
+    video: UploadFile = File(...),
+    chat_id: int = Form(...),
+    duration: int = Form(0),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    content = await video.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    file_ext = os.path.splitext(video.filename or "video.mp4")[1] or ".mp4"
+    file_name = f"videonote-{chat.uuid}-{int(datetime.utcnow().timestamp())}{file_ext}"
+
+    try:
+        await asyncio.to_thread(
+            minio_client.put_object,
+            BUCKET_NAME,
+            file_name,
+            io.BytesIO(content),
+            len(content),
+            content_type=video.content_type or "video/mp4"
+        )
+        video_url = build_public_minio_url(file_name)
+    except Exception as e:
+        logging.error(f"MinIO video_note upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload video note")
+
+    db_video = Message(
+        chat_id=chat_id,
+        message=video_url,
+        message_type="answer",
+        ai=False,
+        created_at=datetime.utcnow(),
+        is_image=False,
+        media_type="video_note",
+        media_duration=duration or None
+    )
+    db.add(db_video)
+    await db.commit()
+    await db.refresh(db_video)
+
+    delivered = True
+    delivery_error: Optional[str] = None
+    ext_id: Optional[str] = None
+    try:
+        if chat.messager == "telegram":
+            if not bot:
+                delivered = False
+                delivery_error = "Telegram bot is not configured"
+                raise RuntimeError(delivery_error)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+                temp_file.write(content)
+                temp_file.flush()
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                sent = await bot.send_video_note(chat_id=tg_chat_id, video_note=FSInputFile(temp_file.name), duration=duration or None)
+                ext_id = str(sent.message_id)
+            os.unlink(temp_file.name)
+        elif chat.messager == "vk":
+            if not vk:
+                delivered = False
+                delivery_error = "VK bot is not configured"
+                raise RuntimeError(delivery_error)
+            vk_msg_id = await asyncio.to_thread(
+                vk.messages.send,
+                peer_id=int(chat.uuid),
+                message="[Видеосообщение]",
+                random_id=0
+            )
+            ext_id = str(vk_msg_id)
+    except Exception as e:
+        delivered = False
+        delivery_error = str(e)
+        logging.error(f"Error sending video_note to {chat.messager}: {e}")
+
+    if ext_id:
+        db_video.external_id = ext_id
+        await db.commit()
+        await db.refresh(db_video)
+
+    message_for_frontend = {
+        "type": "message",
+        "chatId": str(db_video.chat_id),
+        "content": db_video.message,
+        "message_type": db_video.message_type,
+        "ai": db_video.ai,
+        "timestamp": db_video.created_at.isoformat(),
+        "id": db_video.id,
+        "is_image": False,
+        "media_type": "video_note",
+        "media_duration": db_video.media_duration
+    }
+    await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+    if FORUM_GROUP_ID and bot and chat.topic_id:
+        try:
+            video_input = BufferedInputFile(content, filename=file_name)
+            await bot.send_video_note(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=chat.topic_id,
+                video_note=video_input
+            )
+        except Exception as e:
+            logging.error("Failed to forward web-dashboard video_note to forum: %s", e)
+
+    return {"message": db_video, "delivered": delivered, "delivery_error": delivery_error}
+
+
+@app.post("/api/messages/file")
+async def upload_file(
+    file: UploadFile = File(...),
+    chat_id: int = Form(...),
+    db: AsyncSession = Depends(get_db),
+    _: bool = Depends(auth.require_auth)
+):
+    chat = await get_chat(db, chat_id)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    original_name = file.filename or "file"
+    if not _is_file_allowed(original_name):
+        ext = os.path.splitext(original_name)[1].lower()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Тип файла '{ext}' запрещён. Разрешены: документы, архивы, медиа."
+        )
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="Файл слишком большой (макс. 20 МБ)")
+
+    file_ext = os.path.splitext(original_name)[1].lower() or ".bin"
+    safe_name = re.sub(r'[^\w\-.]', '_', original_name)
+    storage_name = f"file-{chat.uuid}-{int(datetime.utcnow().timestamp())}-{safe_name}"
+
+    content_type = file.content_type or "application/octet-stream"
+
+    try:
+        await asyncio.to_thread(
+            minio_client.put_object,
+            BUCKET_NAME,
+            storage_name,
+            io.BytesIO(content),
+            len(content),
+            content_type=content_type
+        )
+        file_url = build_public_minio_url(storage_name)
+    except Exception as e:
+        logging.error(f"MinIO file upload error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload file")
+
+    db_file = Message(
+        chat_id=chat_id,
+        message=file_url,
+        message_type="answer",
+        ai=False,
+        created_at=datetime.utcnow(),
+        is_image=False,
+        media_type="file",
+        file_name=original_name,
+        file_size=len(content)
+    )
+    db.add(db_file)
+    await db.commit()
+    await db.refresh(db_file)
+
+    delivered = True
+    delivery_error: Optional[str] = None
+    ext_id: Optional[str] = None
+    try:
+        if chat.messager == "telegram":
+            if not bot:
+                delivered = False
+                delivery_error = "Telegram bot is not configured"
+                raise RuntimeError(delivery_error)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp_file:
+                temp_file.write(content)
+                temp_file.flush()
+                tg_chat_id = int(chat.uuid) if str(chat.uuid).isdigit() else chat.uuid
+                sent = await bot.send_document(
+                    chat_id=tg_chat_id,
+                    document=FSInputFile(temp_file.name, filename=original_name)
+                )
+                ext_id = str(sent.message_id)
+            os.unlink(temp_file.name)
+        elif chat.messager == "vk":
+            if not vk:
+                delivered = False
+                delivery_error = "VK bot is not configured"
+                raise RuntimeError(delivery_error)
+            upload_server = await asyncio.to_thread(
+                vk.docs.getMessagesUploadServer, peer_id=int(chat.uuid)
+            )
+            upload_url = upload_server['upload_url']
+            current_session = http_session if http_session and not http_session.closed else aiohttp.ClientSession()
+            try:
+                form = aiohttp.FormData()
+                form.add_field('file', content, filename=original_name, content_type=content_type)
+                async with current_session.post(upload_url, data=form) as resp:
+                    if resp.status != 200:
+                        raise Exception(f"VK file upload failed: {resp.status}")
+                    upload_result = await resp.json()
+            finally:
+                if current_session != http_session:
+                    await current_session.close()
+            doc_data = await asyncio.to_thread(
+                vk.docs.save, file=upload_result['file'], title=original_name
+            )
+            doc = doc_data['doc']
+            vk_msg_id = await asyncio.to_thread(
+                vk.messages.send,
+                peer_id=int(chat.uuid),
+                attachment=f"doc{doc['owner_id']}_{doc['id']}",
+                random_id=0
+            )
+            ext_id = str(vk_msg_id)
+    except Exception as e:
+        delivered = False
+        delivery_error = str(e)
+        logging.error(f"Error sending file to {chat.messager}: {e}")
+
+    if ext_id:
+        db_file.external_id = ext_id
+        await db.commit()
+        await db.refresh(db_file)
+
+    message_for_frontend = {
+        "type": "message",
+        "chatId": str(db_file.chat_id),
+        "content": db_file.message,
+        "message_type": db_file.message_type,
+        "ai": db_file.ai,
+        "timestamp": db_file.created_at.isoformat(),
+        "id": db_file.id,
+        "is_image": False,
+        "media_type": "file",
+        "file_name": db_file.file_name,
+        "file_size": db_file.file_size
+    }
+    await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+    if FORUM_GROUP_ID and bot and chat.topic_id:
+        try:
+            file_input = BufferedInputFile(content, filename=original_name)
+            await bot.send_document(
+                chat_id=FORUM_GROUP_ID,
+                message_thread_id=chat.topic_id,
+                document=file_input,
+                caption="[Менеджер (веб)]: Файл"
+            )
+        except Exception as e:
+            logging.error("Failed to forward web-dashboard file to forum: %s", e)
+
+    return {"message": db_file, "delivered": delivered, "delivery_error": delivery_error}
+
 
 def _is_forum_group(message: types.Message) -> bool:
     """Проверяет, что сообщение пришло из нашей форум-группы"""
@@ -5249,7 +5693,8 @@ async def handle_photos(message: types.Message):
                 message_type="question",
                 ai=False,
                 created_at=datetime.utcnow(),
-                is_image=True
+                is_image=True,
+                media_type="image"
             )
             session.add(new_message)
             await session.commit()
@@ -5262,7 +5707,8 @@ async def handle_photos(message: types.Message):
                 "ai": new_message.ai,
                 "timestamp": new_message.created_at.isoformat(),
                 "id": new_message.id,
-                "is_image": new_message.is_image
+                "is_image": new_message.is_image,
+                "media_type": "image"
             }
             await messages_manager.broadcast(json.dumps(message_for_frontend))
 
@@ -5292,6 +5738,291 @@ async def handle_photos(message: types.Message):
     else:
         await message.reply("Произошла ошибка при загрузке фото")
 
+
+@dp.message(F.voice)
+async def handle_voice(message: types.Message):
+    if _is_forum_group(message):
+        return
+
+    voice = message.voice
+    file = await bot.get_file(voice.file_id)
+    file_data = await bot.download_file(file.file_path)
+
+    file_extension = os.path.splitext(file.file_path)[1] or ".ogg"
+    file_name = f"voice-{message.from_user.id}-{voice.file_id}{file_extension}"
+
+    try:
+        minio_client.put_object(
+            bucket_name=BUCKET_NAME,
+            object_name=file_name,
+            data=file_data,
+            length=voice.file_size,
+            content_type="audio/ogg"
+        )
+    except Exception as e:
+        logging.error(f"MinIO voice upload error: {e}")
+        await message.reply("Произошла ошибка при загрузке голосового сообщения")
+        return
+
+    async with async_session() as session:
+        chat = await get_chat_by_uuid(session, str(message.chat.id))
+        if not chat:
+            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+
+        voice_url = build_public_minio_url(file_name)
+
+        new_message = Message(
+            chat_id=chat.id,
+            message=voice_url,
+            message_type="question",
+            ai=False,
+            created_at=datetime.utcnow(),
+            is_image=False,
+            media_type="voice",
+            media_duration=voice.duration
+        )
+        session.add(new_message)
+        await session.commit()
+        await session.refresh(new_message)
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(new_message.chat_id),
+            "content": new_message.message,
+            "message_type": new_message.message_type,
+            "ai": new_message.ai,
+            "timestamp": new_message.created_at.isoformat(),
+            "id": new_message.id,
+            "is_image": False,
+            "media_type": "voice",
+            "media_duration": new_message.media_duration
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        if FORUM_GROUP_ID and bot and chat.topic_id:
+            try:
+                file_data_for_forum = await bot.download_file(file.file_path)
+                content_bytes = file_data_for_forum.read() if hasattr(file_data_for_forum, 'read') else file_data_for_forum
+                voice_input = BufferedInputFile(content_bytes, filename=file_name)
+                source_label = "TG" if chat.messager == "telegram" else "VK"
+                header = f"[{source_label}] {chat.name or 'Клиент'}"
+                await bot.send_voice(
+                    chat_id=FORUM_GROUP_ID,
+                    message_thread_id=chat.topic_id,
+                    voice=voice_input,
+                    caption=f"{header}: Голосовое сообщение"
+                )
+            except Exception as e:
+                logging.error("Failed to forward TG voice to forum: %s", e)
+
+        update_message = {
+            "type": "chat_update",
+            "chat_id": chat.id,
+            "waiting": True
+        }
+        await updates_manager.broadcast(json.dumps(update_message))
+
+        notification_manager = notifications.get_notification_manager()
+        if notification_manager:
+            await notification_manager.send_waiting_notification(
+                chat_id=message.chat.id,
+                chat_name=message.chat.first_name or str(message.chat.id),
+                messager="telegram"
+            )
+
+
+@dp.message(F.video_note)
+async def handle_video_note(message: types.Message):
+    if _is_forum_group(message):
+        return
+
+    video_note = message.video_note
+    file = await bot.get_file(video_note.file_id)
+    file_data = await bot.download_file(file.file_path)
+
+    file_extension = os.path.splitext(file.file_path)[1] or ".mp4"
+    file_name = f"videonote-{message.from_user.id}-{video_note.file_id}{file_extension}"
+
+    try:
+        minio_client.put_object(
+            bucket_name=BUCKET_NAME,
+            object_name=file_name,
+            data=file_data,
+            length=video_note.file_size,
+            content_type="video/mp4"
+        )
+    except Exception as e:
+        logging.error(f"MinIO video_note upload error: {e}")
+        await message.reply("Произошла ошибка при загрузке видеосообщения")
+        return
+
+    async with async_session() as session:
+        chat = await get_chat_by_uuid(session, str(message.chat.id))
+        if not chat:
+            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+
+        video_url = build_public_minio_url(file_name)
+
+        new_message = Message(
+            chat_id=chat.id,
+            message=video_url,
+            message_type="question",
+            ai=False,
+            created_at=datetime.utcnow(),
+            is_image=False,
+            media_type="video_note",
+            media_duration=video_note.duration
+        )
+        session.add(new_message)
+        await session.commit()
+        await session.refresh(new_message)
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(new_message.chat_id),
+            "content": new_message.message,
+            "message_type": new_message.message_type,
+            "ai": new_message.ai,
+            "timestamp": new_message.created_at.isoformat(),
+            "id": new_message.id,
+            "is_image": False,
+            "media_type": "video_note",
+            "media_duration": new_message.media_duration
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        if FORUM_GROUP_ID and bot and chat.topic_id:
+            try:
+                file_data_for_forum = await bot.download_file(file.file_path)
+                content_bytes = file_data_for_forum.read() if hasattr(file_data_for_forum, 'read') else file_data_for_forum
+                video_input = BufferedInputFile(content_bytes, filename=file_name)
+                await bot.send_video_note(
+                    chat_id=FORUM_GROUP_ID,
+                    message_thread_id=chat.topic_id,
+                    video_note=video_input
+                )
+            except Exception as e:
+                logging.error("Failed to forward TG video_note to forum: %s", e)
+
+        update_message = {
+            "type": "chat_update",
+            "chat_id": chat.id,
+            "waiting": True
+        }
+        await updates_manager.broadcast(json.dumps(update_message))
+
+        notification_manager = notifications.get_notification_manager()
+        if notification_manager:
+            await notification_manager.send_waiting_notification(
+                chat_id=message.chat.id,
+                chat_name=message.chat.first_name or str(message.chat.id),
+                messager="telegram"
+            )
+
+
+@dp.message(F.document)
+async def handle_document(message: types.Message):
+    if _is_forum_group(message):
+        return
+
+    document = message.document
+    original_name = document.file_name or "file"
+
+    if not _is_file_allowed(original_name):
+        await message.reply("Этот тип файла не поддерживается.")
+        return
+
+    if document.file_size and document.file_size > MAX_FILE_SIZE:
+        await message.reply("Файл слишком большой (макс. 20 МБ).")
+        return
+
+    file = await bot.get_file(document.file_id)
+    file_data = await bot.download_file(file.file_path)
+
+    safe_name = re.sub(r'[^\w\-.]', '_', original_name)
+    storage_name = f"file-{message.from_user.id}-{document.file_id}-{safe_name}"
+
+    try:
+        file_bytes = file_data.read() if hasattr(file_data, 'read') else file_data
+        minio_client.put_object(
+            bucket_name=BUCKET_NAME,
+            object_name=storage_name,
+            data=io.BytesIO(file_bytes),
+            length=len(file_bytes),
+            content_type=document.mime_type or "application/octet-stream"
+        )
+    except Exception as e:
+        logging.error(f"MinIO document upload error: {e}")
+        await message.reply("Произошла ошибка при загрузке файла")
+        return
+
+    async with async_session() as session:
+        chat = await get_chat_by_uuid(session, str(message.chat.id))
+        if not chat:
+            chat = await create_chat(session, str(message.chat.id), name=message.chat.first_name, messager="telegram")
+
+        file_url = build_public_minio_url(storage_name)
+
+        new_message = Message(
+            chat_id=chat.id,
+            message=file_url,
+            message_type="question",
+            ai=False,
+            created_at=datetime.utcnow(),
+            is_image=False,
+            media_type="file",
+            file_name=original_name,
+            file_size=document.file_size
+        )
+        session.add(new_message)
+        await session.commit()
+        await session.refresh(new_message)
+
+        message_for_frontend = {
+            "type": "message",
+            "chatId": str(new_message.chat_id),
+            "content": new_message.message,
+            "message_type": new_message.message_type,
+            "ai": new_message.ai,
+            "timestamp": new_message.created_at.isoformat(),
+            "id": new_message.id,
+            "is_image": False,
+            "media_type": "file",
+            "file_name": new_message.file_name,
+            "file_size": new_message.file_size
+        }
+        await messages_manager.broadcast(json.dumps(message_for_frontend))
+
+        if FORUM_GROUP_ID and bot and chat.topic_id:
+            try:
+                file_data_for_forum = await bot.download_file(file.file_path)
+                content_bytes = file_data_for_forum.read() if hasattr(file_data_for_forum, 'read') else file_data_for_forum
+                doc_input = BufferedInputFile(content_bytes, filename=original_name)
+                source_label = "TG" if chat.messager == "telegram" else "VK"
+                header = f"[{source_label}] {chat.name or 'Клиент'}"
+                await bot.send_document(
+                    chat_id=FORUM_GROUP_ID,
+                    message_thread_id=chat.topic_id,
+                    document=doc_input,
+                    caption=f"{header}: {original_name}"
+                )
+            except Exception as e:
+                logging.error("Failed to forward TG document to forum: %s", e)
+
+        update_message = {
+            "type": "chat_update",
+            "chat_id": chat.id,
+            "waiting": True
+        }
+        await updates_manager.broadcast(json.dumps(update_message))
+
+        notification_manager = notifications.get_notification_manager()
+        if notification_manager:
+            await notification_manager.send_waiting_notification(
+                chat_id=message.chat.id,
+                chat_name=message.chat.first_name or str(message.chat.id),
+                messager="telegram"
+            )
 
 
 if __name__ == "__main__":

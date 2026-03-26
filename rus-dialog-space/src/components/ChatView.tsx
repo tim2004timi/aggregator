@@ -3,7 +3,7 @@ import { Message, Chat, getChatMessages, sendMessage as apiSendMessage, toggleAi
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical, FileText, StickyNote, Smile, Star, Pencil, X, Check } from 'lucide-react';
+import { Send, Trash2, Paperclip, ArrowDown, RotateCw, BarChart3, TrendingUp, MessageSquare, Target, Lightbulb, MoreVertical, FileText, StickyNote, Smile, Star, Pencil, X, Check, Mic, Video, Square, Play, Pause, Download } from 'lucide-react';
 import { toast } from '@/components/ui/sonner';
 import {
   AlertDialog,
@@ -58,6 +58,22 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
   useEffect(() => {
     getCurrentUser().then(setCurrentUser).catch(console.error);
   }, []);
+
+  const [isRecordingVoice, setIsRecordingVoice] = useState(false);
+  const [voiceRecordingTime, setVoiceRecordingTime] = useState(0);
+  const [isRecordingVideo, setIsRecordingVideo] = useState(false);
+  const [videoRecordingTime, setVideoRecordingTime] = useState(0);
+  const [showVideoRecorder, setShowVideoRecorder] = useState(false);
+  const voiceRecorderRef = useRef<MediaRecorder | null>(null);
+  const voiceChunksRef = useRef<Blob[]>([]);
+  const voiceTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const voiceTimeRef = useRef(0);
+  const videoRecorderRef = useRef<MediaRecorder | null>(null);
+  const videoChunksRef = useRef<Blob[]>([]);
+  const videoTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const videoTimeRef = useRef(0);
+  const videoPreviewRef = useRef<HTMLVideoElement>(null);
+  const videoStreamRef = useRef<MediaStream | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
@@ -350,10 +366,46 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
     }
   }, [selectedChat]);
 
+  const uploadFile = useCallback(async (file: File) => {
+    if (!selectedChat) return;
+    if (file.size > 20 * 1024 * 1024) {
+      toast.error('Файл слишком большой (макс. 20 МБ)');
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('chat_id', selectedChat.id.toString());
+
+      const response = await fetchWithTokenRefresh(`${API_URL}/messages/file`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => null);
+        const detail = errorData?.detail || 'Не удалось отправить файл';
+        toast.error(detail);
+        return;
+      }
+
+      await response.json();
+      toast.success('Файл отправлен');
+    } catch (error) {
+      console.error('Error uploading file:', error);
+      toast.error('Не удалось отправить файл');
+    }
+  }, [selectedChat]);
+
   const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
-    await uploadImage(file);
+    if (file.type.startsWith('image/')) {
+      await uploadImage(file);
+    } else {
+      await uploadFile(file);
+    }
+    if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -368,6 +420,206 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
       }
     }
   }, [uploadImage]);
+
+  const uploadVoice = useCallback(async (blob: Blob, duration: number) => {
+    if (!selectedChat) return;
+    try {
+      const formData = new FormData();
+      formData.append('voice', blob, 'voice.webm');
+      formData.append('chat_id', selectedChat.id.toString());
+      formData.append('duration', Math.round(duration).toString());
+
+      const response = await fetchWithTokenRefresh(`${API_URL}/messages/voice`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error('Failed to upload voice');
+      toast.success('Голосовое сообщение отправлено');
+    } catch (error) {
+      console.error('Error uploading voice:', error);
+      toast.error('Не удалось отправить голосовое сообщение');
+    }
+  }, [selectedChat]);
+
+  const uploadVideoNote = useCallback(async (blob: Blob, duration: number) => {
+    if (!selectedChat) return;
+    try {
+      const formData = new FormData();
+      formData.append('video', blob, 'video.webm');
+      formData.append('chat_id', selectedChat.id.toString());
+      formData.append('duration', Math.round(duration).toString());
+
+      const response = await fetchWithTokenRefresh(`${API_URL}/messages/video_note`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) throw new Error('Failed to upload video note');
+      toast.success('Видеосообщение отправлено');
+    } catch (error) {
+      console.error('Error uploading video note:', error);
+      toast.error('Не удалось отправить видеосообщение');
+    }
+  }, [selectedChat]);
+
+  const startVoiceRecording = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream, {
+        mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
+          ? 'audio/webm;codecs=opus'
+          : 'audio/webm'
+      });
+      voiceChunksRef.current = [];
+      voiceTimeRef.current = 0;
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) voiceChunksRef.current.push(e.data);
+      };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        const blob = new Blob(voiceChunksRef.current, { type: 'audio/webm' });
+        if (blob.size > 0) {
+          uploadVoice(blob, voiceTimeRef.current);
+        }
+        setVoiceRecordingTime(0);
+        voiceTimeRef.current = 0;
+      };
+      recorder.start(100);
+      voiceRecorderRef.current = recorder;
+      setIsRecordingVoice(true);
+      setVoiceRecordingTime(0);
+      voiceTimerRef.current = setInterval(() => {
+        voiceTimeRef.current += 1;
+        setVoiceRecordingTime(prev => prev + 1);
+      }, 1000);
+    } catch {
+      toast.error('Нет доступа к микрофону');
+    }
+  }, [uploadVoice]);
+
+  const stopVoiceRecording = useCallback(() => {
+    if (voiceRecorderRef.current && voiceRecorderRef.current.state !== 'inactive') {
+      voiceRecorderRef.current.stop();
+    }
+    if (voiceTimerRef.current) {
+      clearInterval(voiceTimerRef.current);
+      voiceTimerRef.current = null;
+    }
+    setIsRecordingVoice(false);
+  }, []);
+
+  const cancelVoiceRecording = useCallback(() => {
+    if (voiceRecorderRef.current && voiceRecorderRef.current.state !== 'inactive') {
+      voiceRecorderRef.current.ondataavailable = null;
+      voiceRecorderRef.current.onstop = () => {
+        voiceRecorderRef.current?.stream.getTracks().forEach(t => t.stop());
+      };
+      voiceRecorderRef.current.stop();
+    }
+    if (voiceTimerRef.current) {
+      clearInterval(voiceTimerRef.current);
+      voiceTimerRef.current = null;
+    }
+    voiceChunksRef.current = [];
+    setIsRecordingVoice(false);
+    setVoiceRecordingTime(0);
+  }, []);
+
+  const startVideoRecording = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 384, height: 384, facingMode: 'user' },
+        audio: true
+      });
+      videoStreamRef.current = stream;
+      setShowVideoRecorder(true);
+
+      setTimeout(() => {
+        if (videoPreviewRef.current) {
+          videoPreviewRef.current.srcObject = stream;
+        }
+      }, 100);
+    } catch {
+      toast.error('Нет доступа к камере');
+    }
+  }, []);
+
+  const beginVideoCapture = useCallback(() => {
+    if (!videoStreamRef.current) return;
+    const recorder = new MediaRecorder(videoStreamRef.current, {
+      mimeType: MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : 'video/webm'
+    });
+    videoChunksRef.current = [];
+    videoTimeRef.current = 0;
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) videoChunksRef.current.push(e.data);
+    };
+    recorder.onstop = () => {
+      const blob = new Blob(videoChunksRef.current, { type: 'video/webm' });
+      if (blob.size > 0) {
+        uploadVideoNote(blob, videoTimeRef.current);
+      }
+      stopVideoStream();
+    };
+    recorder.start(100);
+    videoRecorderRef.current = recorder;
+    setIsRecordingVideo(true);
+    setVideoRecordingTime(0);
+    videoTimerRef.current = setInterval(() => {
+      videoTimeRef.current += 1;
+      setVideoRecordingTime(prev => prev + 1);
+    }, 1000);
+  }, [uploadVideoNote, stopVideoStream]);
+
+  const stopVideoRecording = useCallback(() => {
+    if (videoRecorderRef.current && videoRecorderRef.current.state !== 'inactive') {
+      videoRecorderRef.current.stop();
+    }
+    if (videoTimerRef.current) {
+      clearInterval(videoTimerRef.current);
+      videoTimerRef.current = null;
+    }
+    setIsRecordingVideo(false);
+  }, []);
+
+  const stopVideoStream = useCallback(() => {
+    videoStreamRef.current?.getTracks().forEach(t => t.stop());
+    videoStreamRef.current = null;
+    setShowVideoRecorder(false);
+    setIsRecordingVideo(false);
+    setVideoRecordingTime(0);
+    if (videoTimerRef.current) {
+      clearInterval(videoTimerRef.current);
+      videoTimerRef.current = null;
+    }
+  }, []);
+
+  const cancelVideoRecording = useCallback(() => {
+    if (videoRecorderRef.current && videoRecorderRef.current.state !== 'inactive') {
+      videoRecorderRef.current.ondataavailable = null;
+      videoRecorderRef.current.onstop = () => {};
+      videoRecorderRef.current.stop();
+    }
+    videoChunksRef.current = [];
+    stopVideoStream();
+  }, [stopVideoStream]);
+
+  useEffect(() => {
+    return () => {
+      if (voiceTimerRef.current) clearInterval(voiceTimerRef.current);
+      if (videoTimerRef.current) clearInterval(videoTimerRef.current);
+      videoStreamRef.current?.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  const formatRecordingTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
 
   useEffect(() => {
     if (selectedChat && selectedChat.id === chatId) {
@@ -561,9 +813,95 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
         )}
       </div>
 
+      {/* Video Recorder Overlay */}
+      {showVideoRecorder && (
+        <div className="absolute inset-0 z-30 bg-black/80 flex flex-col items-center justify-center">
+          <div className="relative">
+            <video
+              ref={videoPreviewRef}
+              autoPlay
+              muted
+              playsInline
+              className="w-64 h-64 sm:w-80 sm:h-80 rounded-full object-cover border-4 border-white/20"
+              style={{ transform: 'scaleX(-1)' }}
+            />
+            {isRecordingVideo && (
+              <div className="absolute top-2 left-1/2 -translate-x-1/2 bg-red-500 text-white text-sm font-mono px-3 py-1 rounded-full flex items-center gap-2">
+                <div className="w-2 h-2 bg-white rounded-full animate-pulse" />
+                {formatRecordingTime(videoRecordingTime)}
+              </div>
+            )}
+          </div>
+          <div className="mt-6 flex items-center gap-4">
+            <button
+              type="button"
+              className="h-12 w-12 rounded-full bg-white/20 text-white hover:bg-white/30 flex items-center justify-center transition-colors"
+              onClick={cancelVideoRecording}
+            >
+              <X size={24} />
+            </button>
+            {!isRecordingVideo ? (
+              <button
+                type="button"
+                className="h-16 w-16 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center transition-colors border-4 border-white/30"
+                onClick={beginVideoCapture}
+              >
+                <div className="w-6 h-6 rounded-full bg-white" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="h-16 w-16 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center transition-colors border-4 border-white/30"
+                onClick={stopVideoRecording}
+              >
+                <Square size={24} fill="white" />
+              </button>
+            )}
+            <div className="h-12 w-12" />
+          </div>
+        </div>
+      )}
+
       {/* Message Input Area */}
       <div className="border-t border-gray-200 bg-white flex-shrink-0 pb-[safe-area-inset-bottom]">
         <div className="p-3 sm:p-4">
+          {isRecordingVoice ? (
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                className="text-red-500 hover:text-red-600 transition-colors p-2 h-10 w-10 flex items-center justify-center"
+                onClick={cancelVoiceRecording}
+              >
+                <X size={20} />
+              </button>
+              <div className="flex-1 flex items-center gap-3 bg-red-50 rounded-xl px-4 py-2">
+                <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse" />
+                <span className="text-red-600 font-mono text-sm">
+                  {formatRecordingTime(voiceRecordingTime)}
+                </span>
+                <div className="flex-1 flex items-center gap-0.5">
+                  {Array.from({ length: 20 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className="w-1 bg-red-300 rounded-full animate-pulse"
+                      style={{
+                        height: `${8 + Math.random() * 16}px`,
+                        animationDelay: `${i * 0.05}s`
+                      }}
+                    />
+                  ))}
+                </div>
+              </div>
+              <Button
+                type="button"
+                size="icon"
+                className="h-10 w-10 bg-red-500 text-white rounded-full hover:bg-red-600 flex-shrink-0"
+                onClick={stopVoiceRecording}
+              >
+                <Send size={18} />
+              </Button>
+            </div>
+          ) : (
             <form onSubmit={handleSendMessage} className="flex items-end gap-2">
                 <button 
                     type="button" 
@@ -577,7 +915,7 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
                     type="file"
                     ref={fileInputRef}
                     className="hidden"
-                    accept="image/*"
+                    accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.rtf,.odt,.ods,.odp,.zip,.rar,.7z,.tar,.gz,.mp3,.wav,.ogg,.flac,.aac,.mp4,.mov,.avi,.mkv,.webm,.json,.xml,.html,.css,.md"
                     onChange={handleFileSelect}
                 />
                 
@@ -617,16 +955,40 @@ const ChatView = ({ chatId, onChatDeleted }: ChatViewProps) => {
                         />
                     </PopoverContent>
                 </Popover>
-                
-                <Button
-                    type="submit"
-                    size="icon"
-                    disabled={!newMessage.trim() || !canWrite}
-                    className="h-10 w-10 bg-black text-white rounded-full hover:bg-gray-800 flex-shrink-0"
-                >
-                    <Send size={18} />
-                </Button>
+
+                {!newMessage.trim() ? (
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      className="text-gray-400 hover:text-gray-600 transition-colors p-2 h-10 w-10 flex items-center justify-center"
+                      onClick={startVoiceRecording}
+                      disabled={!canWrite}
+                      title="Голосовое сообщение"
+                    >
+                      <Mic size={20} />
+                    </button>
+                    <button
+                      type="button"
+                      className="text-gray-400 hover:text-gray-600 transition-colors p-2 h-10 w-10 flex items-center justify-center"
+                      onClick={startVideoRecording}
+                      disabled={!canWrite}
+                      title="Видеосообщение (кружок)"
+                    >
+                      <Video size={20} />
+                    </button>
+                  </div>
+                ) : (
+                  <Button
+                      type="submit"
+                      size="icon"
+                      disabled={!newMessage.trim() || !canWrite}
+                      className="h-10 w-10 bg-black text-white rounded-full hover:bg-gray-800 flex-shrink-0"
+                  >
+                      <Send size={18} />
+                  </Button>
+                )}
             </form>
+          )}
         </div>
         
         {/* Navigation Island */}
@@ -912,8 +1274,8 @@ const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleP
 
   return (
     <div className={`mb-4 flex ${isQuestion ? 'justify-start' : 'justify-end'} group`}>
-      {/* Edit/delete buttons for answer messages (on hover, left side) */}
-      {isAnswer && !message.is_image && !isEditing && (
+      {/* Edit/delete buttons for answer text messages (on hover, left side) */}
+      {isAnswer && !message.is_image && !message.media_type && !isEditing && (
         <div className="flex items-center gap-1 mr-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             type="button"
@@ -933,8 +1295,8 @@ const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleP
           </button>
         </div>
       )}
-      {/* Delete-only button for answer images */}
-      {isAnswer && message.is_image && (
+      {/* Delete-only button for answer media (images, voice, video, files) */}
+      {isAnswer && (message.is_image || message.media_type) && (
         <div className="flex items-center gap-1 mr-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             type="button"
@@ -987,6 +1349,17 @@ const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleP
               </button>
             </div>
           </div>
+        ) : message.media_type === 'voice' ? (
+          <VoicePlayer src={message.message} duration={message.media_duration} isQuestion={isQuestion} />
+        ) : message.media_type === 'video_note' ? (
+          <VideoNotePlayer src={message.message} />
+        ) : message.media_type === 'file' ? (
+          <FileAttachment
+            src={message.message}
+            fileName={message.file_name}
+            fileSize={message.file_size}
+            isQuestion={isQuestion}
+          />
         ) : message.is_image ? (
           <div className="flex flex-col gap-2">
             <Dialog open={open} onOpenChange={handleDialogOpenChange}>
@@ -1090,6 +1463,198 @@ const MessageBubble = ({ message, formatTime, onDelete, onEdit }: MessageBubbleP
         </AlertDialogContent>
       </AlertDialog>
     </div>
+  );
+};
+
+const VoicePlayer = ({ src, duration, isQuestion }: { src: string; duration?: number | null; isQuestion: boolean }) => {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [totalDuration, setTotalDuration] = useState(duration || 0);
+
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (playing) {
+      audioRef.current.pause();
+    } else {
+      audioRef.current.play();
+    }
+    setPlaying(!playing);
+  };
+
+  const formatTime = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const handleTimeUpdate = () => {
+    if (audioRef.current) {
+      setCurrentTime(audioRef.current.currentTime);
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (audioRef.current && audioRef.current.duration && isFinite(audioRef.current.duration)) {
+      setTotalDuration(audioRef.current.duration);
+    }
+  };
+
+  const handleEnded = () => setPlaying(false);
+
+  const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!audioRef.current || !totalDuration) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = (e.clientX - rect.left) / rect.width;
+    audioRef.current.currentTime = ratio * totalDuration;
+  };
+
+  const progress = totalDuration > 0 ? (currentTime / totalDuration) * 100 : 0;
+
+  return (
+    <div className="flex items-center gap-2 min-w-[200px]">
+      <audio
+        ref={audioRef}
+        src={src}
+        onTimeUpdate={handleTimeUpdate}
+        onLoadedMetadata={handleLoadedMetadata}
+        onEnded={handleEnded}
+        preload="metadata"
+      />
+      <button
+        type="button"
+        onClick={togglePlay}
+        className={`h-9 w-9 rounded-full flex items-center justify-center flex-shrink-0 transition-colors ${
+          isQuestion ? 'bg-gray-400 hover:bg-gray-500 text-white' : 'bg-white/20 hover:bg-white/30 text-white'
+        }`}
+      >
+        {playing ? <Pause size={16} /> : <Play size={16} className="ml-0.5" />}
+      </button>
+      <div className="flex-1 flex flex-col gap-1">
+        <div
+          className="h-1.5 rounded-full cursor-pointer relative overflow-hidden"
+          style={{ backgroundColor: isQuestion ? 'rgba(0,0,0,0.15)' : 'rgba(255,255,255,0.2)' }}
+          onClick={handleSeek}
+        >
+          <div
+            className="absolute inset-y-0 left-0 rounded-full transition-[width]"
+            style={{
+              width: `${progress}%`,
+              backgroundColor: isQuestion ? '#374151' : '#ffffff'
+            }}
+          />
+        </div>
+        <span className={`text-[10px] font-mono ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
+          {formatTime(currentTime)} / {formatTime(totalDuration)}
+        </span>
+      </div>
+    </div>
+  );
+};
+
+const VideoNotePlayer = ({ src }: { src: string }) => {
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [playing, setPlaying] = useState(false);
+
+  const togglePlay = () => {
+    if (!videoRef.current) return;
+    if (playing) {
+      videoRef.current.pause();
+    } else {
+      videoRef.current.play();
+    }
+    setPlaying(!playing);
+  };
+
+  return (
+    <div className="relative cursor-pointer group/video" onClick={togglePlay}>
+      <video
+        ref={videoRef}
+        src={src}
+        className="w-48 h-48 sm:w-56 sm:h-56 rounded-full object-cover"
+        playsInline
+        onEnded={() => setPlaying(false)}
+        preload="metadata"
+      />
+      {!playing && (
+        <div className="absolute inset-0 flex items-center justify-center rounded-full bg-black/20 group-hover/video:bg-black/30 transition-colors">
+          <div className="h-12 w-12 rounded-full bg-white/80 flex items-center justify-center">
+            <Play size={24} className="text-gray-800 ml-1" />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const FILE_ICON_COLORS: Record<string, string> = {
+  pdf: 'bg-red-100 text-red-600',
+  doc: 'bg-blue-100 text-blue-600',
+  docx: 'bg-blue-100 text-blue-600',
+  xls: 'bg-green-100 text-green-600',
+  xlsx: 'bg-green-100 text-green-600',
+  ppt: 'bg-orange-100 text-orange-600',
+  pptx: 'bg-orange-100 text-orange-600',
+  zip: 'bg-yellow-100 text-yellow-700',
+  rar: 'bg-yellow-100 text-yellow-700',
+  '7z': 'bg-yellow-100 text-yellow-700',
+  txt: 'bg-gray-100 text-gray-600',
+  csv: 'bg-green-100 text-green-700',
+};
+
+const FileAttachment = ({
+  src,
+  fileName,
+  fileSize,
+  isQuestion,
+}: {
+  src: string;
+  fileName?: string | null;
+  fileSize?: number | null;
+  isQuestion: boolean;
+}) => {
+  const name = fileName || 'Файл';
+  const ext = name.split('.').pop()?.toLowerCase() || '';
+  const iconColor = FILE_ICON_COLORS[ext] || 'bg-gray-100 text-gray-500';
+
+  const formatSize = (bytes: number) => {
+    if (bytes < 1024) return `${bytes} Б`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+  };
+
+  return (
+    <a
+      href={src}
+      target="_blank"
+      rel="noopener noreferrer"
+      download={name}
+      className={`flex items-center gap-3 px-3 py-2 rounded-lg transition-colors min-w-[200px] ${
+        isQuestion
+          ? 'bg-gray-200/60 hover:bg-gray-200'
+          : 'bg-white/10 hover:bg-white/20'
+      }`}
+    >
+      <div className={`h-10 w-10 rounded-lg flex items-center justify-center flex-shrink-0 ${iconColor}`}>
+        <FileText size={20} />
+      </div>
+      <div className="flex-1 min-w-0">
+        <p className={`text-sm font-medium truncate ${isQuestion ? 'text-gray-800' : 'text-white'}`}>
+          {name}
+        </p>
+        <div className="flex items-center gap-2">
+          {fileSize != null && (
+            <span className={`text-xs ${isQuestion ? 'text-gray-500' : 'text-gray-300'}`}>
+              {formatSize(fileSize)}
+            </span>
+          )}
+          <span className={`text-xs uppercase ${isQuestion ? 'text-gray-400' : 'text-gray-400'}`}>
+            {ext}
+          </span>
+        </div>
+      </div>
+      <Download size={16} className={`flex-shrink-0 ${isQuestion ? 'text-gray-400' : 'text-gray-300'}`} />
+    </a>
   );
 };
 

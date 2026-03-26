@@ -158,6 +158,10 @@ export interface Message {
   message_type: 'question' | 'answer' | 'text';
   ai: boolean;
   is_image: boolean;
+  media_type?: 'image' | 'voice' | 'video_note' | 'file' | null;
+  media_duration?: number | null;
+  file_name?: string | null;
+  file_size?: number | null;
   edited_at?: string | null;
 }
 
@@ -280,6 +284,10 @@ export const getChatMessages = async (chatId: number | string): Promise<Message[
         message_type,
         ai: typeof m["ai"] === "boolean" ? m["ai"] : false,
         is_image: Boolean(m["is_image"]),
+        media_type: (m["media_type"] as Message["media_type"]) || null,
+        media_duration: m["media_duration"] != null ? Number(m["media_duration"]) : null,
+        file_name: m["file_name"] ? String(m["file_name"]) : null,
+        file_size: m["file_size"] != null ? Number(m["file_size"]) : null,
         edited_at: m["edited_at"] ? String(m["edited_at"]) : null,
       };
     });
@@ -325,6 +333,8 @@ export const sendMessage = async (chatId: number, message: string, isAi: boolean
       message_type: newMessage.message_type,
       ai: newMessage.ai,
       is_image: newMessage.is_image || false,
+      media_type: newMessage.media_type || null,
+      media_duration: newMessage.media_duration || null,
     };
   } catch (error) {
     console.error('Error sending message:', error);

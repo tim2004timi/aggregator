@@ -742,7 +742,29 @@ const MessageBubble = ({ message, formatTime }: MessageBubbleProps) => {
             <div className="mr-1 text-xs px-1 py-0.5 bg-white/20 rounded">ИИ</div>
           )}
         </div>
-        {message.is_image ? (
+        {message.media_type === 'voice' ? (
+          <div className="flex items-center gap-2 min-w-[180px]">
+            <audio src={message.message} controls className="h-8 max-w-full" preload="metadata" />
+          </div>
+        ) : message.media_type === 'video_note' ? (
+          <video
+            src={message.message}
+            className="w-48 h-48 rounded-full object-cover"
+            controls
+            playsInline
+            preload="metadata"
+          />
+        ) : message.media_type === 'file' ? (
+          <a
+            href={message.message}
+            target="_blank"
+            rel="noopener noreferrer"
+            download={message.file_name || 'file'}
+            className="flex items-center gap-2 px-3 py-2 rounded-lg bg-white/10 hover:bg-white/20 transition-colors"
+          >
+            <span className="text-sm font-medium truncate">{message.file_name || 'Файл'}</span>
+          </a>
+        ) : message.is_image ? (
           <div className="flex flex-col gap-2">
             <Dialog open={open} onOpenChange={handleDialogOpenChange}>
               <DialogTrigger asChild>

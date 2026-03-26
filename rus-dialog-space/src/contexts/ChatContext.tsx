@@ -29,6 +29,10 @@ interface IncomingMessageWebSocket {
     timestamp: string;
     id: number;
     is_image?: boolean;
+    media_type?: 'image' | 'voice' | 'video_note' | 'file' | null;
+    media_duration?: number | null;
+    file_name?: string | null;
+    file_size?: number | null;
 }
 
 export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -113,6 +117,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
             message_type: wsMsgTyped.message_type === 'question' ? 'question' : 'answer',
             ai: wsMsgTyped.ai,
             is_image: wsMsgTyped.is_image || false,
+            media_type: wsMsgTyped.media_type || null,
+            media_duration: wsMsgTyped.media_duration || null,
+            file_name: wsMsgTyped.file_name || null,
+            file_size: wsMsgTyped.file_size || null,
           };
 
           setMessages(prevMessages => [...prevMessages, newMessage]);

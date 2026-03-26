@@ -67,6 +67,10 @@ class Message(Base):
     ai = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
     is_image = Column(Boolean, default=False)
+    media_type = Column(String, nullable=True, default=None)  # null=text, "image", "voice", "video_note", "file"
+    media_duration = Column(Integer, nullable=True, default=None)
+    file_name = Column(String, nullable=True, default=None)
+    file_size = Column(Integer, nullable=True, default=None)
     edited_at = Column(DateTime(timezone=True), nullable=True, default=None)
     external_id = Column(String, nullable=True, default=None)
     chat = relationship("Chat", back_populates="messages")
@@ -316,6 +320,10 @@ async def get_chat_messages(db: AsyncSession, chat_id: int, limit: int = 50, off
             "timestamp": msg.created_at.isoformat() if msg.created_at else None,
             "chatId": str(chat_id),
             "is_image": msg.is_image,
+            "media_type": msg.media_type,
+            "media_duration": msg.media_duration,
+            "file_name": msg.file_name,
+            "file_size": msg.file_size,
             "edited_at": msg.edited_at.isoformat() if msg.edited_at else None
         }
         for msg in messages
